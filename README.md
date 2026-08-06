@@ -9,6 +9,8 @@
 1. 调用签到接口 `POST https://glados.cloud/api/user/checkin`
 2. 调用状态接口 `GET https://glados.cloud/api/user/status`，读取 `data.leftDays`
 
+如果签到请求异常、返回 HTTP 错误或返回未知结果，脚本会等待 10 分钟后再次签到。只有第二次仍然失败时，才会发送失败邮件并让 GitHub Actions 任务失败。
+
 鉴权方式直接使用完整的 Cookie 字符串，从环境变量 `GLADOS_COOKIE` 读取，并原样放入请求头 `Cookie`。这适合包含 `koa:sess` 和 `koa:sess.sig` 的场景，不需要在脚本里单独拆分。
 
 默认签到请求体为：
@@ -30,7 +32,8 @@
 .
 |-- .github
 |   `-- workflows
-|       `-- checkin.yml
+|       |-- checkin.yml
+|       `-- keepalive.yml
 |-- checkin.py
 |-- requirements.txt
 `-- README.md
@@ -72,6 +75,8 @@ python checkin.py
 
 同时保留了 `workflow_dispatch`，可以在 GitHub 页面手动点一次运行，方便测试。
 
+仓库保活工作流为 `.github/workflows/keepalive.yml`。它每天检查最近一次提交的时间（`00:17 UTC`，北京时间 `08:17`），只有距最近一次提交达到 45 天时才会创建一个空提交，从而保持定时 Actions 活跃。
+
 ## GitHub 上的配置步骤
 
 1. 在 GitHub 新建仓库，并把本目录文件推送上去。
@@ -85,8 +90,31 @@ python checkin.py
 koa:sess=...; koa:sess.sig=...
 ```
 
-7. 保存后进入 `Actions` 页面。
-8. 首次可以手动执行 `GLaDOS Checkin` 工作流，确认日志正常。
+7. 如果要接收失败邮件，继续添加下面的 SMTP Secrets。
+8. 保存后进入 `Actions` 页面。
+9. 首次可以手动执行 `GLaDOS Checkin` 工作流，确认日志正常。
+
+## 失败邮件配置
+
+在 `Settings` -> `Secrets and variables` -> `Actions` 中添加以下 Repository secrets：
+
+| 名称 | 说明 |
+| --- | --- |
+| `SMTP_HOST` | SMTP 服务器，例如 `smtp.gmail.com` |
+| `SMTP_PORT` | SMTP 端口，587 或 465；不填时默认为 587 |
+| `SMTP_USERNAME` | SMTP 登录用户名，通常是邮箱地址 |
+| `SMTP_PASSWORD` | SMTP 密码或邮箱应用专用密码 |
+| `MAIL_TO` | 接收失败提醒的邮箱地址 |
+| `MAIL_FROM` | 发件人地址，可选；不填时使用 `SMTP_USERNAME` |
+| `SMTP_USE_SSL` | 可选；使用 465 端口时填写 `true`，587 端口填写 `false` |
+
+例如 Gmail 通常使用 `smtp.gmail.com`、端口 `587`、`SMTP_USE_SSL=false`，并使用应用专用密码。脚本不会把 Cookie 放入邮件内容。
+
+邮件配置缺失时，签到失败仍会正常让任务失败，但日志会提示邮件未发送以及缺少哪些配置。
+
+## 保活权限
+
+`keepalive.yml` 需要向仓库推送空提交。进入 `Settings` -> `Actions` -> `General` -> `Workflow permissions`，选择 `Read and write permissions` 并保存。工作流文件本身也声明了 `contents: write` 权限。
 
 ## 日志输出
 
@@ -98,6 +126,8 @@ koa:sess=...; koa:sess.sig=...
 - 状态接口 HTTP 状态码
 - 状态接口返回 JSON
 - 当前剩余天数
+- 第一次失败后的 10 分钟重试结果
+- 连续失败时的邮件发送结果
 
 ## Cookie 获取说明
 
