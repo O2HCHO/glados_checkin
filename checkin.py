@@ -14,13 +14,21 @@ from urllib.parse import urlparse
 import requests
 
 
-BASE_URL = os.getenv("GLADOS_BASE_URL", "https://glados.cloud").rstrip("/")
-CHECKIN_URL = f"{BASE_URL}/api/user/checkin"
-STATUS_URL = f"{BASE_URL}/api/user/status"
-CHECKIN_PAGE_URL = f"{BASE_URL}/console/checkin"
-DEFAULT_TOKEN = os.getenv("GLADOS_CHECKIN_TOKEN", "").strip() or (
-    urlparse(BASE_URL).hostname or "glados.cloud"
+CONFIGURED_BASE_URL = os.getenv("GLADOS_BASE_URL", "").strip().rstrip("/")
+BASE_URL = CONFIGURED_BASE_URL or "https://glados.cloud"
+SUPPORTED_BASE_URLS = (
+    "https://glados.cloud",
+    "https://glados.network",
+    "https://glados.rocks",
+    "https://glados.one",
+    "https://glados.space",
+    "https://glados.vip",
+    "https://glados-facility.com",
 )
+CANDIDATE_BASE_URLS = (
+    (CONFIGURED_BASE_URL,) if CONFIGURED_BASE_URL else SUPPORTED_BASE_URLS
+)
+TOKEN_OVERRIDE = os.getenv("GLADOS_CHECKIN_TOKEN", "").strip()
 TIMEOUT = 20
 RETRY_DELAY_SECONDS = max(
     0, int(os.getenv("GLADOS_RETRY_DELAY_SECONDS", "60").strip() or "60")
@@ -39,7 +47,7 @@ def log(message: str) -> None:
 
 
 def normalize_cookie(raw_cookie: str) -> str:
-    """Return the two Koa session cookies in HTTP Cookie-header format."""
+    """Return a valid HTTP Cookie header while preserving extra cookie fields."""
     value = html.unescape(raw_cookie).strip().strip("\"'“”‘’").strip()
     if value.lower().startswith("cookie:"):
         value = value.split(":", 1)[1].strip()
@@ -51,6 +59,10 @@ def normalize_cookie(raw_cookie: str) -> str:
     if session_match or signature_match:
         if not (session_match and signature_match):
             raise ValueError("Cookie must contain both koa:sess and koa:sess.sig.")
+        if ";" in value:
+            # A value copied from Request Headers may contain additional
+            # session/device cookies required by the current web client.
+            return value
         return (
             f"koa:sess={session_match.group(1)}; "
             f"koa:sess.sig={signature_match.group(1)}"
@@ -68,13 +80,13 @@ def normalize_cookie(raw_cookie: str) -> str:
     )
 
 
-def build_headers(cookie: str) -> Dict[str, str]:
+def build_headers(cookie: str, base_url: str = BASE_URL) -> Dict[str, str]:
     return {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json;charset=UTF-8",
         "Cookie": cookie,
-        "Origin": BASE_URL,
-        "Referer": CHECKIN_PAGE_URL,
+        "Origin": base_url,
+        "Referer": f"{base_url}/console/checkin",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -107,10 +119,16 @@ def parse_json_response(response: requests.Response) -> Dict[str, Any]:
     return data
 
 
-def request_checkin(session: requests.Session, headers: Dict[str, str]) -> Tuple[Dict[str, Any], int]:
-    payload = {"token": DEFAULT_TOKEN}
-    log(f"Requesting checkin endpoint: {CHECKIN_URL}")
-    response = session.post(CHECKIN_URL, headers=headers, json=payload, timeout=TIMEOUT)
+def request_checkin(
+    session: requests.Session,
+    headers: Dict[str, str],
+    base_url: str = BASE_URL,
+) -> Tuple[Dict[str, Any], int]:
+    token = TOKEN_OVERRIDE or (urlparse(base_url).hostname or "glados.cloud")
+    checkin_url = f"{base_url}/api/user/checkin"
+    payload = {"token": token}
+    log(f"Requesting checkin endpoint: {checkin_url}")
+    response = session.post(checkin_url, headers=headers, json=payload, timeout=TIMEOUT)
     data = parse_json_response(response)
 
     log(f"Checkin HTTP status: {response.status_code}")
@@ -119,15 +137,58 @@ def request_checkin(session: requests.Session, headers: Dict[str, str]) -> Tuple
     return data, response.status_code
 
 
-def request_status(session: requests.Session, headers: Dict[str, str]) -> Tuple[Dict[str, Any], int]:
-    log(f"Requesting status endpoint: {STATUS_URL}")
-    response = session.get(STATUS_URL, headers=headers, timeout=TIMEOUT)
+def request_status(
+    session: requests.Session,
+    headers: Dict[str, str],
+    base_url: str = BASE_URL,
+) -> Tuple[Dict[str, Any], int]:
+    status_url = f"{base_url}/api/user/status"
+    log(f"Requesting status endpoint: {status_url}")
+    response = session.get(status_url, headers=headers, timeout=TIMEOUT)
     data = parse_json_response(response)
 
     log(f"Status HTTP status: {response.status_code}")
-    log(f"Status response: {data}")
+    log(
+        "Status response: "
+        f"code={data.get('code')}, message={data.get('message', '<none>')}"
+    )
 
     return data, response.status_code
+
+
+def find_logged_in_session(
+    session: requests.Session,
+    cookie: str,
+) -> Tuple[str, Dict[str, str]]:
+    """Find the official origin on which this cookie is authenticated."""
+    failures = []
+    for base_url in CANDIDATE_BASE_URLS:
+        headers = build_headers(cookie, base_url)
+        try:
+            data, http_status = request_status(session, headers, base_url)
+        except (requests.RequestException, RuntimeError) as exc:
+            failures.append(f"{base_url}: {exc}")
+            continue
+
+        if (
+            http_status < 400
+            and data.get("code") == 0
+            and isinstance(data.get("data"), dict)
+        ):
+            log(f"Authenticated GLaDOS session found on {base_url}.")
+            return base_url, headers
+
+        failures.append(
+            f"{base_url}: HTTP {http_status}, code={data.get('code')}, "
+            f"message={data.get('message', '<none>')}"
+        )
+
+    if CONFIGURED_BASE_URL:
+        hint = "Check that GLADOS_BASE_URL matches the domain used to obtain the Cookie."
+    else:
+        hint = "The Cookie was rejected by every supported GLaDOS domain."
+    log("Session probe failures: " + " | ".join(failures))
+    raise RuntimeError(hint + " Log in again and copy Cookie from /api/user/status.")
 
 
 def is_normal_checkin_result(data: Dict[str, Any]) -> bool:
@@ -145,11 +206,12 @@ def perform_checkin(
     session: requests.Session,
     headers: Dict[str, str],
     attempt_number: int,
+    base_url: str = BASE_URL,
 ) -> CheckinResult:
     log(f"Starting checkin attempt {attempt_number}.")
 
     try:
-        checkin_data, checkin_status = request_checkin(session, headers)
+        checkin_data, checkin_status = request_checkin(session, headers, base_url)
     except requests.RequestException as exc:
         summary = f"Request error: {exc}"
         log(f"Checkin failed: {summary}")
@@ -287,10 +349,14 @@ def main() -> int:
         log(str(exc))
         return 1
 
-    headers = build_headers(cookie)
-
     with requests.Session() as session:
-        first_attempt = perform_checkin(session, headers, 1)
+        try:
+            active_base_url, headers = find_logged_in_session(session, cookie)
+        except RuntimeError as exc:
+            log(f"Authentication failed: {exc}")
+            return 1
+
+        first_attempt = perform_checkin(session, headers, 1, active_base_url)
         final_attempt = first_attempt
 
         if not first_attempt.success:
@@ -299,12 +365,14 @@ def main() -> int:
                 f"Retrying in {RETRY_DELAY_SECONDS} seconds."
             )
             time.sleep(RETRY_DELAY_SECONDS)
-            final_attempt = perform_checkin(session, headers, 2)
+            final_attempt = perform_checkin(session, headers, 2, active_base_url)
 
         status_summary = "Status endpoint was not requested."
         status_ok = True
         try:
-            status_data, status_code = request_status(session, headers)
+            status_data, status_code = request_status(
+                session, headers, active_base_url
+            )
         except requests.RequestException as exc:
             status_summary = f"Request error: {exc}"
             log(f"Failed to request status endpoint: {exc}")
