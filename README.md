@@ -9,7 +9,7 @@
 1. 调用签到接口 `POST https://glados.cloud/api/user/checkin`
 2. 调用状态接口 `GET https://glados.cloud/api/user/status`，读取 `data.leftDays`
 
-如果签到请求异常、返回 HTTP 错误或返回未知结果，脚本会等待 10 分钟后再次签到。只有第二次仍然失败时，才会发送失败邮件并让 GitHub Actions 任务失败。
+如果签到请求异常、返回 HTTP 错误或返回未知结果，脚本会等待后再次签到。默认等待 60 秒；GitHub Actions 配置为 30 秒。只有第二次仍然失败时，才会发送失败邮件并让 GitHub Actions 任务失败。
 
 鉴权方式使用环境变量 `GLADOS_COOKIE`。推荐填写完整 Cookie 字符串；脚本也兼容只复制两个值并以空格分隔的形式，以及聊天软件转义出的 `&#x20;` 空格。发送请求前只保留 `koa:sess` 和 `koa:sess.sig`。
 
@@ -25,6 +25,7 @@
 
 - `GLADOS_BASE_URL`
 - `GLADOS_CHECKIN_TOKEN`
+- `GLADOS_RETRY_DELAY_SECONDS`
 
 ## 目录结构
 

@@ -11,6 +11,7 @@ permissions:
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -33,4 +34,5 @@ jobs:
           SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-        run: python checkin.py
+          GLADOS_RETRY_DELAY_SECONDS: "30"
+        run: python -u checkin.py

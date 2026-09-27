@@ -22,7 +22,9 @@ DEFAULT_TOKEN = os.getenv("GLADOS_CHECKIN_TOKEN", "").strip() or (
     urlparse(BASE_URL).hostname or "glados.cloud"
 )
 TIMEOUT = 20
-RETRY_DELAY_SECONDS = 10 * 60
+RETRY_DELAY_SECONDS = max(
+    0, int(os.getenv("GLADOS_RETRY_DELAY_SECONDS", "60").strip() or "60")
+)
 BEIJING_TZ = timezone(timedelta(hours=8))
 NORMAL_CHECKIN_MESSAGES = (
     "checkin! got",
@@ -33,7 +35,7 @@ NORMAL_CHECKIN_MESSAGES = (
 
 def log(message: str) -> None:
     now = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-    print(f"[{now}] {message}")
+    print(f"[{now}] {message}", flush=True)
 
 
 def normalize_cookie(raw_cookie: str) -> str:
@@ -292,9 +294,9 @@ def main() -> int:
         final_attempt = first_attempt
 
         if not first_attempt.success:
-            delay_minutes = RETRY_DELAY_SECONDS // 60
             log(
-                f"First checkin attempt failed. Retrying in {delay_minutes} minutes."
+                "First checkin attempt failed. "
+                f"Retrying in {RETRY_DELAY_SECONDS} seconds."
             )
             time.sleep(RETRY_DELAY_SECONDS)
             final_attempt = perform_checkin(session, headers, 2)
