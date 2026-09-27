@@ -1,4 +1,6 @@
+import html
 import os
+import re
 import smtplib
 import sys
 import time
@@ -7,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -15,15 +18,52 @@ BASE_URL = os.getenv("GLADOS_BASE_URL", "https://glados.cloud").rstrip("/")
 CHECKIN_URL = f"{BASE_URL}/api/user/checkin"
 STATUS_URL = f"{BASE_URL}/api/user/status"
 CHECKIN_PAGE_URL = f"{BASE_URL}/console/checkin"
-DEFAULT_TOKEN = os.getenv("GLADOS_CHECKIN_TOKEN", "glados.one")
+DEFAULT_TOKEN = os.getenv("GLADOS_CHECKIN_TOKEN", "").strip() or (
+    urlparse(BASE_URL).hostname or "glados.cloud"
+)
 TIMEOUT = 20
 RETRY_DELAY_SECONDS = 10 * 60
 BEIJING_TZ = timezone(timedelta(hours=8))
+NORMAL_CHECKIN_MESSAGES = (
+    "checkin! got",
+    "checkin repeats! please try tomorrow",
+    "today's observation logged",
+)
 
 
 def log(message: str) -> None:
     now = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{now}] {message}")
+
+
+def normalize_cookie(raw_cookie: str) -> str:
+    """Return the two Koa session cookies in HTTP Cookie-header format."""
+    value = html.unescape(raw_cookie).strip().strip("\"'“”‘’").strip()
+    if value.lower().startswith("cookie:"):
+        value = value.split(":", 1)[1].strip()
+
+    # Values copied from rendered HTML or chat may use whitespace instead of a
+    # semicolon. Extracting by name avoids forwarding unrelated browser cookies.
+    session_match = re.search(r"(?:^|[;\s])koa:sess=([^;\s]+)", value)
+    signature_match = re.search(r"(?:^|[;\s])koa:sess\.sig=([^;\s]+)", value)
+    if session_match or signature_match:
+        if not (session_match and signature_match):
+            raise ValueError("Cookie must contain both koa:sess and koa:sess.sig.")
+        return (
+            f"koa:sess={session_match.group(1)}; "
+            f"koa:sess.sig={signature_match.group(1)}"
+        )
+
+    # Also accept the two raw values copied separately, which is the format
+    # some cookie editors and chat applications produce.
+    parts = [part for part in re.split(r"[;\s]+", value) if part]
+    if len(parts) == 2:
+        return f"koa:sess={parts[0]}; koa:sess.sig={parts[1]}"
+
+    raise ValueError(
+        "Cookie format is invalid; expected "
+        "'koa:sess=...; koa:sess.sig=...' or the two raw values."
+    )
 
 
 def build_headers(cookie: str) -> Dict[str, str]:
@@ -88,6 +128,17 @@ def request_status(session: requests.Session, headers: Dict[str, str]) -> Tuple[
     return data, response.status_code
 
 
+def is_normal_checkin_result(data: Dict[str, Any]) -> bool:
+    """Recognize a real check-in or an explicit already-checked-in reply."""
+    message = str(data.get("message", "")).strip().lower()
+    if any(marker in message for marker in NORMAL_CHECKIN_MESSAGES):
+        return True
+
+    # code=0 has historically represented a successful check-in. code=1 is
+    # deliberately not enough: GLaDOS also uses it for rejected old tokens.
+    return data.get("code") == 0
+
+
 def perform_checkin(
     session: requests.Session,
     headers: Dict[str, str],
@@ -112,11 +163,11 @@ def perform_checkin(
     if checkin_status >= 400:
         summary = f"HTTP {checkin_status}; message: {message}"
         success = False
-    elif code == 0:
-        summary = f"Succeeded; message: {message}"
-        success = True
-    elif code == 1:
-        summary = f"Already checked in today; message: {message}"
+    elif is_normal_checkin_result(checkin_data):
+        if "repeats" in str(message).lower():
+            summary = f"Already checked in today; message: {message}"
+        else:
+            summary = f"Succeeded; message: {message}"
         success = True
     else:
         summary = f"Unexpected result; code: {code}, message: {message}"
@@ -223,9 +274,15 @@ def extract_left_days(status_data: Dict[str, Any]) -> Optional[str]:
 
 
 def main() -> int:
-    cookie = os.getenv("GLADOS_COOKIE", "").strip()
-    if not cookie:
+    raw_cookie = os.getenv("GLADOS_COOKIE", "").strip()
+    if not raw_cookie:
         log("Missing environment variable GLADOS_COOKIE.")
+        return 1
+
+    try:
+        cookie = normalize_cookie(raw_cookie)
+    except ValueError as exc:
+        log(str(exc))
         return 1
 
     headers = build_headers(cookie)

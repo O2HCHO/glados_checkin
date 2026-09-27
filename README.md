@@ -11,17 +11,17 @@
 
 如果签到请求异常、返回 HTTP 错误或返回未知结果，脚本会等待 10 分钟后再次签到。只有第二次仍然失败时，才会发送失败邮件并让 GitHub Actions 任务失败。
 
-鉴权方式直接使用完整的 Cookie 字符串，从环境变量 `GLADOS_COOKIE` 读取，并原样放入请求头 `Cookie`。这适合包含 `koa:sess` 和 `koa:sess.sig` 的场景，不需要在脚本里单独拆分。
+鉴权方式使用环境变量 `GLADOS_COOKIE`。推荐填写完整 Cookie 字符串；脚本也兼容只复制两个值并以空格分隔的形式，以及聊天软件转义出的 `&#x20;` 空格。发送请求前只保留 `koa:sess` 和 `koa:sess.sig`。
 
 默认签到请求体为：
 
 ```json
 {
-  "token": "glados.one"
+  "token": "glados.cloud"
 }
 ```
 
-如果后续站点调整了 token 或域名，可以通过环境变量覆盖：
+签到 token 默认自动取 `GLADOS_BASE_URL` 的主机名，避免域名与 token 不一致。如果后续站点调整了 token 或域名，也可以通过环境变量覆盖：
 
 - `GLADOS_BASE_URL`
 - `GLADOS_CHECKIN_TOKEN`
