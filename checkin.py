@@ -1,406 +1,331 @@
+"""GLaDOS check-in aligned with pyx13638516490/glados_checkin."""
+import hashlib
 import html
+import json
 import os
 import re
 import smtplib
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 
 
-CONFIGURED_BASE_URL = os.getenv("GLADOS_BASE_URL", "").strip().rstrip("/")
-BASE_URL = CONFIGURED_BASE_URL or "https://glados.cloud"
+DEFAULT_BASE_URL = "https://glados.cloud"
+FALLBACK_BASE_URLS = ("https://glados.rocks", "https://glados.network")
 SUPPORTED_BASE_URLS = (
-    "https://glados.cloud",
-    "https://glados.network",
-    "https://glados.rocks",
-    "https://glados.one",
-    "https://glados.space",
-    "https://glados.vip",
-    "https://glados-facility.com",
+    DEFAULT_BASE_URL, *FALLBACK_BASE_URLS, "https://glados.one",
+    "https://glados.space", "https://glados.vip", "https://glados-facility.com",
 )
-CANDIDATE_BASE_URLS = (
-    (CONFIGURED_BASE_URL,) if CONFIGURED_BASE_URL else SUPPORTED_BASE_URLS
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
-TOKEN_OVERRIDE = os.getenv("GLADOS_CHECKIN_TOKEN", "").strip()
-TIMEOUT = 20
-RETRY_DELAY_SECONDS = max(
-    0, int(os.getenv("GLADOS_RETRY_DELAY_SECONDS", "60").strip() or "60")
-)
+TIMEOUT = (10, 30)
+MAX_ATTEMPTS = 3
+EXIT_OK, EXIT_FATAL, EXIT_RETRYABLE = 0, 1, 2
 BEIJING_TZ = timezone(timedelta(hours=8))
-NORMAL_CHECKIN_MESSAGES = (
-    "checkin! got",
-    "checkin repeats! please try tomorrow",
-    "today's observation logged",
+SECRET_VALUES = set()
+COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_\x60|~0-9A-Za-z:]+$")
+RAW_VALUE = re.compile(r"^[A-Za-z0-9_+/-]+={0,2}$")
+SUCCESS_MARKERS = ("checkin!", "checkin repeats", "observation logged")
+AUTH_ERROR_MARKERS = (
+    "not login", "not logged", "please login", "unauthorized",
+    "invalid cookie", "cookie expired", "session expired",
+    "没有权限", "未登录", "请先登录", "登录已过期",
 )
 
 
-def log(message: str) -> None:
-    now = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-    print(f"[{now}] {message}", flush=True)
+class FatalError(RuntimeError):
+    """Credentials/configuration/API reply needs user attention."""
 
 
-def normalize_cookie(raw_cookie: str) -> str:
-    """Return a valid HTTP Cookie header while preserving extra cookie fields."""
-    value = html.unescape(raw_cookie).strip().strip("\"'“”‘’").strip()
-    if value.lower().startswith("cookie:"):
-        value = value.split(":", 1)[1].strip()
+class RetryableError(RuntimeError):
+    """Temporary network/server failure."""
 
-    # Values copied from rendered HTML or chat may use whitespace instead of a
-    # semicolon. Extracting by name avoids forwarding unrelated browser cookies.
-    session_match = re.search(r"(?:^|[;\s])koa:sess=([^;\s]+)", value)
-    signature_match = re.search(r"(?:^|[;\s])koa:sess\.sig=([^;\s]+)", value)
-    if session_match or signature_match:
-        if not (session_match and signature_match):
-            raise ValueError("Cookie must contain both koa:sess and koa:sess.sig.")
-        if ";" in value:
-            # A value copied from Request Headers may contain additional
-            # session/device cookies required by the current web client.
-            return value
-        return (
-            f"koa:sess={session_match.group(1)}; "
-            f"koa:sess.sig={signature_match.group(1)}"
-        )
 
-    # Also accept the two raw values copied separately, which is the format
-    # some cookie editors and chat applications produce.
-    parts = [part for part in re.split(r"[;\s]+", value) if part]
-    if len(parts) == 2:
-        return f"koa:sess={parts[0]}; koa:sess.sig={parts[1]}"
+def get_env(name, default=""):
+    return os.getenv(name, "").strip() or default
 
-    raise ValueError(
-        "Cookie format is invalid; expected "
-        "'koa:sess=...; koa:sess.sig=...' or the two raw values."
+
+def redact(text):
+    value = str(text)
+    for secret in sorted(SECRET_VALUES, key=len, reverse=True):
+        if len(secret) >= 4:
+            value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"koa:sess(?:\.sig)?=[^;\s\"']+", "koa:sess=[REDACTED]", value)
+    value = re.sub(r"Bearer\s+\S+", "Bearer [REDACTED]", value, flags=re.I)
+    return re.sub(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[EMAIL]", value
     )
 
 
-def build_headers(cookie: str, base_url: str = BASE_URL) -> Dict[str, str]:
-    return {
+def log(message):
+    now = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S UTC+08:00")
+    print(f"[{now}] {redact(message)}", flush=True)
+
+
+def validate_cookie_header(cookie):
+    # Validate without parsing/reserializing signed values or dropping fields.
+    if any(ord(char) < 32 or ord(char) >= 127 for char in cookie):
+        raise FatalError("Cookie 请求头包含换行或非 ASCII 字符，请复制 Network 中的 Cookie 值。")
+    for part in cookie.split(";"):
+        if not part.strip():
+            continue
+        name, separator, value = part.strip().partition("=")
+        if not separator or not COOKIE_NAME.fullmatch(name) or re.search(r"\s", value):
+            raise FatalError("Cookie 格式无效：需要 name=value; name=value，请勿粘贴 Set-Cookie 属性。")
+    return cookie
+
+
+def normalize_cookie(raw):
+    """Preserve a complete header; convert only explicitly different formats."""
+    cookie = raw.strip()
+    if not cookie:
+        raise FatalError("GLADOS_COOKIE 为空，请检查当前仓库的 Repository Secret。")
+    if len(cookie) >= 2 and (cookie[0], cookie[-1]) in (
+        ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+    ):
+        cookie = cookie[1:-1].strip()
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
+
+    if cookie.startswith(("[", "{")):
+        try:
+            exported = json.loads(cookie)
+        except ValueError as exc:
+            raise FatalError("Cookie JSON 无效，请使用 Cookie-Editor 导出的 JSON。") from exc
+        if isinstance(exported, dict) and isinstance(exported.get("cookie"), str):
+            return normalize_cookie(exported["cookie"])
+        if isinstance(exported, dict) and "name" in exported and "value" in exported:
+            exported = [exported]
+        if not isinstance(exported, list) or not exported:
+            raise FatalError("需要单个账号的 Cookie-Editor JSON 数组或完整 Cookie 请求头。")
+        pairs, names, domains = [], set(), set()
+        for item in exported:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                raise FatalError("Cookie-Editor 每项必须包含 name 和 value。")
+            if not isinstance(item.get("value"), str):
+                raise FatalError("Cookie-Editor 的 value 必须是字符串。")
+            name = item["name"]
+            if name in names:
+                raise FatalError("Cookie JSON 有重复名称，请只导出实际登录域名的 Cookie。")
+            names.add(name)
+            domain = item.get("domain")
+            if isinstance(domain, str) and domain:
+                domains.add(domain.lstrip(".").lower())
+            pairs.append(f"{name}={item['value']}")
+        if len(domains) > 1:
+            raise FatalError("Cookie JSON 包含多个域名，请只导出一个登录域名。")
+        return validate_cookie_header("; ".join(pairs))
+
+    # Only decode HTML spaces in the user's original unnamed two-value format.
+    parts = html.unescape(cookie).split()
+    if len(parts) == 2 and all(RAW_VALUE.fullmatch(part) for part in parts):
+        return validate_cookie_header(f"koa:sess={parts[0]}; koa:sess.sig={parts[1]}")
+
+    # A complete header contains opaque signed data: never HTML/URL/base64
+    # decode, re-encode, or reorder its values.
+    if re.match(r"^[!#$%&'*+\-.^_\x60|~0-9A-Za-z:]+=", cookie):
+        return validate_cookie_header(cookie)
+    raise FatalError("Cookie 无法识别：使用完整 name=value 请求头、Cookie-Editor JSON 或两个原始会话值。")
+
+
+def require_cookie():
+    raw = os.getenv("GLADOS_COOKIE", "")
+    SECRET_VALUES.add(raw.strip())
+    cookie = normalize_cookie(raw)
+    SECRET_VALUES.add(cookie)
+    for part in cookie.split(";"):
+        SECRET_VALUES.add(part.strip().partition("=")[2])
+    raw_fingerprint = hashlib.sha256(raw.strip().encode()).hexdigest()[:12]
+    fingerprint = hashlib.sha256(cookie.encode()).hexdigest()[:12]
+    log(f"Cookie 输入长度={len(raw.strip())}，输入指纹={raw_fingerprint}；"
+        f"请求头长度={len(cookie)}，请求头指纹={fingerprint}。")
+    return cookie
+
+
+def candidate_base_urls():
+    primary = get_env("GLADOS_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    if primary not in SUPPORTED_BASE_URLS:
+        raise FatalError("GLADOS_BASE_URL 必须是受支持的 GLaDOS 官方 HTTPS 域名。")
+    urls = [primary]
+    if get_env("GLADOS_DOMAIN_FALLBACK", "1") != "0":
+        urls.extend(url for url in FALLBACK_BASE_URLS if url not in urls)
+    return urls
+
+
+def token_for_origin(origin):
+    token = get_env("GLADOS_CHECKIN_TOKEN", urlparse(origin).hostname)
+    if token == "glados.one" and origin == DEFAULT_BASE_URL:
+        log("旧 token glados.one 已改用 glados.cloud。")
+        return "glados.cloud"
+    return token
+
+
+def build_session(cookie):
+    session = requests.Session()
+    session.headers.update({
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json;charset=UTF-8",
+        "User-Agent": get_env("GLADOS_USER_AGENT", DEFAULT_USER_AGENT),
         "Cookie": cookie,
-        "Origin": base_url,
-        "Referer": f"{base_url}/console/checkin",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        ),
-    }
+    })
+    return session
 
 
-@dataclass
-class CheckinResult:
-    success: bool
-    summary: str
-    data: Dict[str, Any]
-    http_status: Optional[int]
+def classify_checkin(payload):
+    code = payload.get("code")
+    message = str(payload.get("message", "")).strip().lower()
+    if code == -2 or any(marker in message for marker in AUTH_ERROR_MARKERS):
+        return "auth_error"
+    if code == 4 and payload.get("reason") == "device-mismatch":
+        return "device_mismatch"
+    if "please checkin via" in message or "token error" in message:
+        return "token_error"
+    if code == 0 or (code in (None, 1) and any(marker in message for marker in SUCCESS_MARKERS)):
+        return "success"
+    return "unknown"
 
 
-def parse_json_response(response: requests.Response) -> Dict[str, Any]:
+def request_json(session, method, url, origin, payload=None):
+    last_error = None
+    retry_raw = get_env("GLADOS_RETRY_DELAY_SECONDS")
     try:
-        data = response.json()
-    except ValueError:
-        body = response.text.strip()
-        raise RuntimeError(
-            f"Response is not valid JSON. HTTP {response.status_code}. Body: {body or '<empty>'}"
-        )
-
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            f"Response JSON must be an object. HTTP {response.status_code}."
-        )
-    return data
-
-
-def request_checkin(
-    session: requests.Session,
-    headers: Dict[str, str],
-    base_url: str = BASE_URL,
-) -> Tuple[Dict[str, Any], int]:
-    token = TOKEN_OVERRIDE or (urlparse(base_url).hostname or "glados.cloud")
-    checkin_url = f"{base_url}/api/user/checkin"
-    payload = {"token": token}
-    log(f"Requesting checkin endpoint: {checkin_url}")
-    response = session.post(checkin_url, headers=headers, json=payload, timeout=TIMEOUT)
-    data = parse_json_response(response)
-
-    log(f"Checkin HTTP status: {response.status_code}")
-    log(f"Checkin response: {data}")
-
-    return data, response.status_code
-
-
-def request_status(
-    session: requests.Session,
-    headers: Dict[str, str],
-    base_url: str = BASE_URL,
-) -> Tuple[Dict[str, Any], int]:
-    status_url = f"{base_url}/api/user/status"
-    log(f"Requesting status endpoint: {status_url}")
-    response = session.get(status_url, headers=headers, timeout=TIMEOUT)
-    data = parse_json_response(response)
-
-    log(f"Status HTTP status: {response.status_code}")
-    log(
-        "Status response: "
-        f"code={data.get('code')}, message={data.get('message', '<none>')}"
-    )
-
-    return data, response.status_code
-
-
-def find_logged_in_session(
-    session: requests.Session,
-    cookie: str,
-) -> Tuple[str, Dict[str, str]]:
-    """Find the official origin on which this cookie is authenticated."""
-    failures = []
-    for base_url in CANDIDATE_BASE_URLS:
-        headers = build_headers(cookie, base_url)
+        fixed_delay = int(retry_raw) if retry_raw else None
+        if fixed_delay is not None and not 0 <= fixed_delay <= 60:
+            raise ValueError
+    except ValueError as exc:
+        raise FatalError("GLADOS_RETRY_DELAY_SECONDS 必须是 0 到 60 的整数。") from exc
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            data, http_status = request_status(session, headers, base_url)
-        except (requests.RequestException, RuntimeError) as exc:
-            failures.append(f"{base_url}: {exc}")
+            log(f"{method.upper()} {url} (attempt {attempt}/{MAX_ATTEMPTS})")
+            kwargs = {
+                "timeout": TIMEOUT,
+                "headers": {"Origin": origin, "Referer": f"{origin}/console/checkin"},
+                "allow_redirects": False,
+            }
+            if payload is not None:
+                # Same serialization and data= transport as the friend's script.
+                kwargs["data"] = json.dumps(payload)
+            response = session.request(method, url, **kwargs)
+            log(f"HTTP {response.status_code}")
+            if response.status_code in (401, 403):
+                raise FatalError(f"认证失败 HTTP {response.status_code}；Cookie 或会话未被接受。")
+            if response.status_code == 429 or response.status_code >= 500:
+                raise RetryableError(f"临时服务错误 HTTP {response.status_code}")
+            if 300 <= response.status_code < 400:
+                raise FatalError("接口发生重定向，请核对 GLADOS_BASE_URL；不会向重定向地址转发 Cookie。")
+            if response.status_code >= 400:
+                raise FatalError(f"接口拒绝请求 HTTP {response.status_code}")
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise FatalError("接口返回非 JSON 内容，请检查站点是否出现验证页或接口变化。") from exc
+            if not isinstance(result, dict):
+                raise FatalError("接口响应必须是 JSON 对象。")
+            log(f"API code={result.get('code')}，message={result.get('message', '<none>')}，"
+                f"reason={result.get('reason', '<none>')}")
+            return result
+        except (requests.RequestException, RetryableError) as exc:
+            last_error = exc
+            log(f"临时请求失败：{exc}")
+        if attempt < MAX_ATTEMPTS:
+            delay = fixed_delay if fixed_delay is not None else min(60, 2 ** attempt * 5)
+            log(f"{delay} 秒后重试。")
+            time.sleep(delay)
+    raise RetryableError(f"{MAX_ATTEMPTS} 次请求后仍失败：{last_error}")
+
+
+def do_checkin(session, base_urls):
+    last_error = None
+    for origin in base_urls:
+        token = token_for_origin(origin)
+        try:
+            payload = request_json(session, "post", f"{origin}/api/user/checkin",
+                                   origin, {"token": token})
+        except RetryableError as exc:
+            last_error = exc
+            log(f"{origin} 暂时不可用，尝试备用域名。")
             continue
-
-        if (
-            http_status < 400
-            and data.get("code") == 0
-            and isinstance(data.get("data"), dict)
-        ):
-            log(f"Authenticated GLaDOS session found on {base_url}.")
-            return base_url, headers
-
-        failures.append(
-            f"{base_url}: HTTP {http_status}, code={data.get('code')}, "
-            f"message={data.get('message', '<none>')}"
-        )
-
-    if CONFIGURED_BASE_URL:
-        hint = "Check that GLADOS_BASE_URL matches the domain used to obtain the Cookie."
-    else:
-        hint = "The Cookie was rejected by every supported GLaDOS domain."
-    log("Session probe failures: " + " | ".join(failures))
-    raise RuntimeError(hint + " Log in again and copy Cookie from /api/user/status.")
+        result = classify_checkin(payload)
+        if result == "auth_error":
+            raise FatalError(
+                "签到认证失败：Cookie 或登录会话未被接受。请核对当前仓库 "
+                "GLADOS_COOKIE 的指纹与浏览器请求头；不会重复请求失效凭据。"
+            )
+        if result == "device_mismatch":
+            raise FatalError("GLaDOS 返回 device-mismatch：登录设备与签到设备不匹配，请在登录设备上签到。")
+        if result == "token_error":
+            raise FatalError(f"签到 token 不匹配：域名={origin}，token={token}。")
+        if result != "success":
+            raise FatalError(f"无法确认签到成功：code={payload.get('code')}，"
+                             f"message={payload.get('message', '<none>')}。")
+        log(f"签到成功或今日已签到：{payload.get('message', '<none>')}")
+        return origin
+    raise RetryableError(f"所有候选域名暂时不可用：{last_error}")
 
 
-def is_normal_checkin_result(data: Dict[str, Any]) -> bool:
-    """Recognize a real check-in or an explicit already-checked-in reply."""
-    message = str(data.get("message", "")).strip().lower()
-    if any(marker in message for marker in NORMAL_CHECKIN_MESSAGES):
-        return True
-
-    # code=0 has historically represented a successful check-in. code=1 is
-    # deliberately not enough: GLaDOS also uses it for rejected old tokens.
-    return data.get("code") == 0
-
-
-def perform_checkin(
-    session: requests.Session,
-    headers: Dict[str, str],
-    attempt_number: int,
-    base_url: str = BASE_URL,
-) -> CheckinResult:
-    log(f"Starting checkin attempt {attempt_number}.")
-
-    try:
-        checkin_data, checkin_status = request_checkin(session, headers, base_url)
-    except requests.RequestException as exc:
-        summary = f"Request error: {exc}"
-        log(f"Checkin failed: {summary}")
-        return CheckinResult(False, summary, {}, None)
-    except RuntimeError as exc:
-        summary = str(exc)
-        log(f"Checkin failed: {summary}")
-        return CheckinResult(False, summary, {}, None)
-
-    message = checkin_data.get("message", "No message field returned")
-    code = checkin_data.get("code")
-
-    if checkin_status >= 400:
-        summary = f"HTTP {checkin_status}; message: {message}"
-        success = False
-    elif is_normal_checkin_result(checkin_data):
-        if "repeats" in str(message).lower():
-            summary = f"Already checked in today; message: {message}"
-        else:
-            summary = f"Succeeded; message: {message}"
-        success = True
-    else:
-        summary = f"Unexpected result; code: {code}, message: {message}"
-        success = False
-
-    log(f"Checkin {'succeeded' if success else 'failed'}: {summary}")
-    return CheckinResult(success, summary, checkin_data, checkin_status)
+def report_account(session, origin):
+    # Display failures must not invalidate an already successful check-in.
+    for endpoint, field in (("status", "leftDays"), ("points", "points")):
+        try:
+            result = request_json(session, "get", f"{origin}/api/user/{endpoint}", origin)
+            if result.get("code") != 0:
+                log(f"WARNING: {endpoint} 查询失败；签到结果保持成功。")
+                continue
+            data = result.get("data") if endpoint == "status" else result
+            value = data.get(field) if isinstance(data, dict) else None
+            log(f"{field}={value if value is not None else '<unavailable>'}")
+        except (FatalError, RetryableError) as exc:
+            log(f"WARNING: {endpoint} 查询失败：{exc}；签到结果保持成功。")
 
 
-def send_failure_email(
-    first_attempt: CheckinResult,
-    second_attempt: CheckinResult,
-    status_summary: str,
-) -> None:
-    smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_username = os.getenv("SMTP_USERNAME", "").strip()
-    smtp_password = os.getenv("SMTP_PASSWORD", "")
-    mail_to = os.getenv("MAIL_TO", "").strip()
-    mail_from = os.getenv("MAIL_FROM", "").strip() or smtp_username
-    required = {
-        "SMTP_HOST": smtp_host,
-        "SMTP_USERNAME": smtp_username,
-        "SMTP_PASSWORD": smtp_password,
-        "MAIL_TO": mail_to,
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        log(
-            "Failure email skipped; missing SMTP configuration: "
-            + ", ".join(missing)
-        )
+def send_failure_email(summary):
+    host, username = get_env("SMTP_HOST"), get_env("SMTP_USERNAME")
+    password, recipient = os.getenv("SMTP_PASSWORD", ""), get_env("MAIL_TO")
+    if not all((host, username, password, recipient)):
+        log("未配置完整 SMTP，跳过失败邮件。")
         return
-
     try:
-        smtp_port = int(os.getenv("SMTP_PORT", "").strip() or "587")
-    except ValueError:
-        log("Failure email skipped; SMTP_PORT must be an integer.")
-        return
-
-    use_ssl = os.getenv("SMTP_USE_SSL", "false").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    run_url = ""
-    github_server = os.getenv("GITHUB_SERVER_URL", "").strip()
-    github_repository = os.getenv("GITHUB_REPOSITORY", "").strip()
-    github_run_id = os.getenv("GITHUB_RUN_ID", "").strip()
-    if github_server and github_repository and github_run_id:
-        run_url = f"{github_server}/{github_repository}/actions/runs/{github_run_id}"
-
-    message = EmailMessage()
-    message["Subject"] = "[GLaDOS] Automatic checkin failed twice"
-    message["From"] = mail_from
-    message["To"] = mail_to
-    message.set_content(
-        "GLaDOS automatic checkin failed twice.\n\n"
-        f"First attempt: {first_attempt.summary}\n"
-        f"Second attempt: {second_attempt.summary}\n"
-        f"Status request: {status_summary}\n"
-        f"Time (Beijing): {datetime.now(BEIJING_TZ).isoformat()}\n"
-        + (f"GitHub Actions run: {run_url}\n" if run_url else "")
-    )
-
-    try:
+        port = int(get_env("SMTP_PORT", "587"))
+        use_ssl = get_env("SMTP_USE_SSL", "false").lower() in ("1", "true", "yes", "on")
+        message = EmailMessage()
+        message["Subject"] = "[GLaDOS] Automatic checkin failed"
+        message["From"], message["To"] = get_env("MAIL_FROM", username), recipient
+        body = f"GLaDOS checkin failed.\n\n{redact(summary)}\n"
+        server_url = get_env("GITHUB_SERVER_URL", "https://github.com")
+        repository, run_id = get_env("GITHUB_REPOSITORY"), get_env("GITHUB_RUN_ID")
+        if repository and run_id:
+            body += f"\nActions: {server_url}/{repository}/actions/runs/{run_id}\n"
+        message.set_content(body)
         smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
-        with smtp_class(smtp_host, smtp_port, timeout=TIMEOUT) as server:
+        with smtp_class(host, port, timeout=30) as server:
             if not use_ssl:
                 server.starttls()
-            server.login(smtp_username, smtp_password)
+            server.login(username, password)
             server.send_message(message)
-    except (OSError, smtplib.SMTPException) as exc:
-        log(f"Failure email could not be sent: {exc}")
-        return
-
-    log(f"Failure email sent to {mail_to}.")
+        log("失败邮件已发送。")
+    except (OSError, ValueError, smtplib.SMTPException):
+        log("失败邮件发送失败，请检查 SMTP 配置。")
 
 
-def extract_left_days(status_data: Dict[str, Any]) -> Optional[str]:
-    data = status_data.get("data")
-    if not isinstance(data, dict):
-        return None
-
-    left_days = data.get("leftDays")
-    if left_days is None:
-        return None
-
-    if isinstance(left_days, (int, float)):
-        return str(left_days)
-
-    if isinstance(left_days, str):
-        value = left_days.strip()
-        if not value:
-            return None
-        try:
-            decimal_value = Decimal(value)
-            normalized = decimal_value.quantize(Decimal("0.01"))
-            return format(normalized.normalize(), "f")
-        except (InvalidOperation, ValueError):
-            return value
-
-    return str(left_days)
-
-
-def main() -> int:
-    raw_cookie = os.getenv("GLADOS_COOKIE", "").strip()
-    if not raw_cookie:
-        log("Missing environment variable GLADOS_COOKIE.")
-        return 1
-
+def main():
     try:
-        cookie = normalize_cookie(raw_cookie)
-    except ValueError as exc:
-        log(str(exc))
-        return 1
-
-    with requests.Session() as session:
-        try:
-            active_base_url, headers = find_logged_in_session(session, cookie)
-        except RuntimeError as exc:
-            log(f"Authentication failed: {exc}")
-            return 1
-
-        first_attempt = perform_checkin(session, headers, 1, active_base_url)
-        final_attempt = first_attempt
-
-        if not first_attempt.success:
-            log(
-                "First checkin attempt failed. "
-                f"Retrying in {RETRY_DELAY_SECONDS} seconds."
-            )
-            time.sleep(RETRY_DELAY_SECONDS)
-            final_attempt = perform_checkin(session, headers, 2, active_base_url)
-
-        status_summary = "Status endpoint was not requested."
-        status_ok = True
-        try:
-            status_data, status_code = request_status(
-                session, headers, active_base_url
-            )
-        except requests.RequestException as exc:
-            status_summary = f"Request error: {exc}"
-            log(f"Failed to request status endpoint: {exc}")
-            status_ok = False
-        except RuntimeError as exc:
-            status_summary = str(exc)
-            log(str(exc))
-            status_ok = False
-        else:
-            left_days = extract_left_days(status_data)
-            if status_code >= 400:
-                status_summary = f"HTTP {status_code}"
-                log(f"Failed to fetch status. HTTP {status_code}")
-                status_ok = False
-            elif left_days is not None:
-                status_summary = f"Remaining days: {left_days}"
-                log(f"Remaining days: {left_days}")
-            else:
-                status_summary = "Field data.leftDays was not found."
-                log("Field data.leftDays was not found in the status response.")
-                status_ok = False
-
-        if not final_attempt.success:
-            log("Checkin failed twice; sending failure email notification.")
-            send_failure_email(first_attempt, final_attempt, status_summary)
-            return 1
-
-    return 0 if status_ok else 1
+        cookie = require_cookie()
+        origins = candidate_base_urls()
+        log(f"签到域名候选：{', '.join(origins)}")
+        with build_session(cookie) as session:
+            origin = do_checkin(session, origins)
+            report_account(session, origin)
+        return EXIT_OK
+    except (FatalError, RetryableError) as exc:
+        log(f"ERROR: {exc}")
+        send_failure_email(str(exc))
+        return EXIT_RETRYABLE if isinstance(exc, RetryableError) else EXIT_FATAL
 
 
 if __name__ == "__main__":

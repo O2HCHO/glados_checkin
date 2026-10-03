@@ -1,144 +1,115 @@
 # GLaDOS 自动签到
 
-这个仓库提供一个基于 Python `requests` 的 `glados.cloud` 自动签到脚本，并通过 GitHub Actions 每天定时执行。
+使用 Python requests，通过 GitHub Actions 每天北京时间 09:00 签到。
+本版本参考 [pyx13638516490/glados_checkin](https://github.com/pyx13638516490/glados_checkin/blob/623e3dcd686ff11addaf628b6561ca7478c4f6d7/checkin.py)
+已验证的请求流程重写：完整 Cookie 原样发送，先签到，再查询会员天数与积分；
+默认请求头与朋友的实现一致（Chrome/126.0）。
 
-## 技术方案
+## Cookie 配置
 
-脚本按以下步骤执行：
+在自己仓库的 Settings → Secrets and variables → Actions → **Repository secrets**
+中编辑 GLADOS_COOKIE。推荐使用以下第一种格式：
 
-1. 调用状态接口验证登录，并自动识别 Cookie 所属的官方域名
-2. 在同一域名调用 `POST /api/user/checkin`，请求体 token 自动匹配域名
-3. 再次调用状态接口读取 `data.leftDays`
+### 完整 Cookie 请求头（推荐）
 
-如果签到请求异常、返回 HTTP 错误或返回未知结果，脚本会等待后再次签到。默认等待 60 秒；GitHub Actions 配置为 30 秒。只有第二次仍然失败时，才会发送失败邮件并让 GitHub Actions 任务失败。
+登录 https://glados.cloud，按 F12 → Network，刷新页面，
+在成功的 /api/user/status 请求的 Request Headers 中复制 Cookie 的值：
 
-鉴权方式使用环境变量 `GLADOS_COOKIE`。推荐从浏览器 Network 中复制完整 Cookie 请求头；脚本会保留其中的附加会话字段。它也兼容只复制两个 Koa 会话值并以空格分隔的形式，以及聊天软件转义出的 `&#x20;` 空格。
+~~~text
+koa:sess=完整会话值; koa:sess.sig=完整签名; 其他Cookie=原始值
+~~~
 
-默认签到请求体为：
+不要复制响应中的 Set-Cookie 或 Cookie 列表中的 Domain、Path、Expires 属性。
+完整请求头不会进行 HTML 解码、URL 解码或重新排序，附加字段和签名原样保留。
+可以粘贴带 Cookie: 前缀的单行请求头，脚本会移除前缀。
 
-```json
-{
-  "token": "glados.cloud"
-}
-```
+### 分别复制的两个值
 
-签到 token 默认自动取 `GLADOS_BASE_URL` 的主机名，避免域名与 token 不一致。如果后续站点调整了 token 或域名，也可以通过环境变量覆盖：
+先复制 koa:sess 的值，再复制 koa:sess.sig 的值，用空格分隔：
 
-- `GLADOS_BASE_URL`
-- `GLADOS_CHECKIN_TOKEN`
-- `GLADOS_RETRY_DELAY_SECONDS`
+~~~text
+完整会话值 完整签名
+~~~
 
-## 目录结构
+支持两项之间的换行、聊天软件生成的 &#x20; 空格及整段外侧引号。
+只在这种没有字段名的格式中解码 HTML 空格；Cookie 值本身保持不变。
 
-```text
-.
-|-- .github
-|   `-- workflows
-|       |-- checkin.yml
-|       `-- keepalive.yml
-|-- checkin.py
-|-- requirements.txt
-`-- README.md
-```
+### Cookie-Editor JSON
 
-## 本地运行
+支持单个域名、单个账号的 Cookie-Editor 导出格式：
 
-1. 安装依赖
+~~~json
+[
+  {"name": "koa:sess", "value": "完整会话值", "domain": "glados.cloud"},
+  {"name": "koa:sess.sig", "value": "完整签名", "domain": "glados.cloud"}
+]
+~~~
 
-```bash
-pip install -r requirements.txt
-```
+不要混合不同域名或多个账号的 Cookie。
 
-2. 设置环境变量
+日志仅显示输入与请求头的长度及 SHA-256 前 12 位指纹，不显示 Cookie。
+输入完整请求头时两组指纹应一致。更新 Secret 后运行新的任务；
+指纹不变表示实际传入的内容未变化（或更新的是其他仓库/Secret）。
 
-```bash
-export GLADOS_COOKIE='koa:sess=xxx; koa:sess.sig=yyy'
-```
+## 请求流程与错误处理
 
-Windows PowerShell:
+1. 默认直接 POST https://glados.cloud/api/user/checkin，发送 {"token":"glados.cloud"}。
+2. 明确成功或今日已签到后，再查询 /api/user/status 和 /api/user/points。
+3. 状态或积分查询失败只产生警告，不会把已经成功的签到判为失败。
 
-```powershell
-$env:GLADOS_COOKIE='koa:sess=xxx; koa:sess.sig=yyy'
-```
+默认使用与朋友相同的 Session 请求头、JSON 序列化和 data= 发送方式。
+仅连接异常、超时、HTTP 429 或 5xx 最多重试三次，默认间隔 10、20 秒。
+主域名网络重试仍失败时，尝试 glados.rocks、glados.network。
+-2/没有权限、HTTP 401/403、token 错误和未知结果不会反复重试。
+code=4/reason=device-mismatch 会单独提示登录设备与签到设备不匹配。
+认证失败本身不能区分 Cookie 过期、签名不配对、Secret 内容或账户会话限制。
 
-3. 执行脚本
+退出码：0 成功/今日已签到，1 配置或认证等错误，2 临时网络/服务故障。
+工作流直接保留脚本退出码，不使用 continue-on-error 隐藏失败。
 
-```bash
-python checkin.py
-```
+## 可选配置
 
-## GitHub Actions 配置
+在 Settings → Secrets and variables → Actions → **Variables** 配置：
 
-工作流文件为 `.github/workflows/checkin.yml`。
-
-- 触发时间：`0 1 * * *`
-- 含义：每天 `01:00 UTC`
-- 换算为北京时间：每天早上 `09:00`（UTC+8）
-
-同时保留了 `workflow_dispatch`，可以在 GitHub 页面手动点一次运行，方便测试。
-
-仓库保活工作流为 `.github/workflows/keepalive.yml`。它每天检查最近一次提交的时间（`00:17 UTC`，北京时间 `08:17`），只有距最近一次提交达到 45 天时才会创建一个空提交，从而保持定时 Actions 活跃。
-
-## GitHub 上的配置步骤
-
-1. 在 GitHub 新建仓库，并把本目录文件推送上去。
-2. 进入仓库页面的 `Settings`。
-3. 打开 `Secrets and variables` -> `Actions`。
-4. 点击 `New repository secret`。
-5. 名称填写 `GLADOS_COOKIE`。
-6. 值填写浏览器里复制出来的完整 Cookie 字符串，至少要包含：
-
-```text
-koa:sess=...; koa:sess.sig=...
-```
-
-7. 如果要接收失败邮件，继续添加下面的 SMTP Secrets。
-8. 保存后进入 `Actions` 页面。
-9. 首次可以手动执行 `GLaDOS Checkin` 工作流，确认日志正常。
-
-## 失败邮件配置
-
-在 `Settings` -> `Secrets and variables` -> `Actions` 中添加以下 Repository secrets：
-
-| 名称 | 说明 |
+| Variable | 默认值与用途 |
 | --- | --- |
-| `SMTP_HOST` | SMTP 服务器，例如 `smtp.gmail.com` |
-| `SMTP_PORT` | SMTP 端口，587 或 465；不填时默认为 587 |
-| `SMTP_USERNAME` | SMTP 登录用户名，通常是邮箱地址 |
-| `SMTP_PASSWORD` | SMTP 密码或邮箱应用专用密码 |
-| `MAIL_TO` | 接收失败提醒的邮箱地址 |
-| `MAIL_FROM` | 发件人地址，可选；不填时使用 `SMTP_USERNAME` |
-| `SMTP_USE_SSL` | 可选；使用 465 端口时填写 `true`，587 端口填写 `false` |
+| GLADOS_BASE_URL | https://glados.cloud；必须是受支持的官方 HTTPS 域名 |
+| GLADOS_CHECKIN_TOKEN | 默认取请求域名；cloud 的旧值 glados.one 自动改为 glados.cloud |
+| GLADOS_USER_AGENT | 与参考实现相同的 Chrome/126.0；可填浏览器实际 User-Agent |
+| GLADOS_DOMAIN_FALLBACK | 1；设为 0 关闭网络故障时的备用域名 |
+| GLADOS_RETRY_DELAY_SECONDS | 不填使用 10、20 秒；可设为 0 到 60 的固定秒数 |
 
-例如 Gmail 通常使用 `smtp.gmail.com`、端口 `587`、`SMTP_USE_SSL=false`，并使用应用专用密码。脚本不会把 Cookie 放入邮件内容。
+空的可选变量不会覆盖默认值。Cookie 始终放 Secret，不放 Variables 或代码。
 
-邮件配置缺失时，签到失败仍会正常让任务失败，但日志会提示邮件未发送以及缺少哪些配置。
+## 本地运行与验证
 
-## 保活权限
+~~~powershell
+pip install -r requirements.txt
+$env:GLADOS_COOKIE='koa:sess=完整值; koa:sess.sig=完整签名'
+python -u checkin.py
+python -B -m unittest -v
+~~~
 
-`keepalive.yml` 需要向仓库推送空提交。进入 `Settings` -> `Actions` -> `General` -> `Workflow permissions`，选择 `Read and write permissions` 并保存。工作流文件本身也声明了 `contents: write` 权限。
+GitHub Actions 使用 Python 3.12，运行前自动执行不连接真实账户的回归测试，
+支持手动 Run workflow。任务最多运行 15 分钟，并避免同仓库签到任务并发。
 
-## 日志输出
+## 失败邮件与仓库保活
 
-脚本会在控制台打印：
+保留可选失败邮件。认证/配置错误立即通知；网络故障重试耗尽后通知。
+在 Repository secrets 设置以下字段；缺少配置时跳过邮件，签到仍返回失败。
 
-- 签到接口 URL
-- 签到接口 HTTP 状态码
-- 签到接口返回 JSON
-- 状态接口 HTTP 状态码
-- 状态接口返回 JSON
-- 当前剩余天数
-- 第一次失败后的 10 分钟重试结果
-- 连续失败时的邮件发送结果
+| Secret | 说明 |
+| --- | --- |
+| SMTP_HOST | SMTP 主机 |
+| SMTP_PORT | 默认 587；SSL 通常为 465 |
+| SMTP_USERNAME | 登录用户名 |
+| SMTP_PASSWORD | SMTP 密码或应用专用密码 |
+| SMTP_USE_SSL | 465 通常设 true；默认 false 使用 STARTTLS |
+| MAIL_TO | 收件人 |
+| MAIL_FROM | 可选；默认使用 SMTP 用户名 |
 
-## Cookie 获取说明
+邮件只包含脱敏的错误说明与 Actions 链接。
 
-在浏览器登录 `https://glados.cloud` 后：
-
-1. 打开开发者工具
-2. 进入 `Application` 或 `Storage`
-3. 找到站点 Cookie
-4. 复制完整 Cookie 字符串
-5. 确保其中包含 `koa:sess` 和 `koa:sess.sig`
-
-建议不要只复制单个字段，直接复制整段 Cookie 并写入 `GLADOS_COOKIE`。
+保活工作流保持原配置：每天检查提交时间，达到 45 天时创建空提交。
+它需要仓库 Settings → Actions → General → Workflow permissions 中的
+Read and write permissions，工作流同时声明 contents: write。
