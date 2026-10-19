@@ -46,7 +46,7 @@ jobs:
           git commit --allow-empty -m "chore: keep repository active"
           git push origin "HEAD:${DEFAULT_BRANCH}"
 
-      - name: Repair an expired random checkin schedule
+      - name: Verify random checkin schedule without advancing a missed run
         timeout-minutes: 3
         env:
           SCHEDULE_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}

@@ -66,8 +66,9 @@ def classify_checkin(data):
     if data.get("captcha_required"):
         return CheckinResult("fatal", "签到接口要求人机验证，需要人工处理。", source="api-cookie")
     if data.get("reason") == "device-mismatch":
-        return CheckinResult("fatal", "签到接口返回 device-mismatch；请使用同一已登录浏览器的 Cookie、"
-                             "glados.fp.v1 和 User-Agent 配置 GLADOS_COOKIE、GLADOS_FP、GLADOS_USER_AGENT。",
+        return CheckinResult("fatal", "签到接口返回 device-mismatch；请核对同一已登录浏览器的 Cookie 和 User-Agent。"
+                             "Authorization 是可选项，原请求没有该字段且 glados.fp.v1 为 null 时不要填写 GLADOS_FP。"
+                             "若浏览器手动签到也失败，请按站点提示重新登录后再导出 Cookie。",
                              source="api-cookie")
     message = str(data.get("message", ""))
     if "please checkin via" in message.lower():
@@ -116,6 +117,8 @@ def run(cookie_header=None, dry_run=False, max_attempts=MAX_ATTEMPTS, retry_dela
         if fingerprint:
             session.headers["Authorization"] = fingerprint
         log("Cookie 接口模式：立即签到，复用已有会话，不发送邮箱验证码。")
+        log("设备配置：GLADOS_USER_AGENT=" + ("已配置" if get_env("GLADOS_USER_AGENT") else "未配置")
+            + "；GLADOS_FP=" + ("已配置" if fingerprint else "未配置（可选）") + "。")
         if dry_run:
             data = _json_request(session, requests, "get", "/api/user/status")
             if data.get("code") == 0:

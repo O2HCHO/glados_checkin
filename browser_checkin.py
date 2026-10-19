@@ -34,8 +34,8 @@ CHECKIN_API = re.compile(r"/api/user/checkin(?:$|\?)")
 CHECKIN_BUTTON = "button.checkin-cute-btn"
 ARTIFACT_DIR = "artifacts"
 
-# GLaDOS 前端把设备指纹缓存在 localStorage，并作为 Authorization 请求头发出；
-# 服务端据此校验"登录设备"，不一致就返回 code=4 / device-mismatch。
+# 当前登录页前端有缓存指纹并发送 Authorization 的逻辑；控制台是另一套前端，
+# 不一定发送这个字段。设备不匹配不能单凭此键缺失判断，也可能涉及 UA 等信息。
 FP_STORAGE_KEY = "glados.fp.v1"
 FP_PATTERN = re.compile(r"^fp1\.[0-9a-f]{16,64}$")
 
@@ -177,7 +177,7 @@ def get_fingerprint():
 def _install_fingerprint(context, fingerprint):
     """把指纹写进 localStorage，让站点的指纹计算函数直接命中缓存。
 
-    站点逻辑是：localStorage["glados.fp.v1"] 命中正则就拿来当 Authorization；
+    登录页前端逻辑是：localStorage["glados.fp.v1"] 命中正则就拿来当 Authorization；
     否则用 canvas/webgl/时区等实时计算。仅在该会话确实需要设备校验时，
     沿用用户从同一已登录浏览器导出的缓存值。
     """
@@ -450,8 +450,8 @@ def run(cookie_header=None, headless=True, dry_run=False, max_attempts=MAX_ATTEM
                 _install_fingerprint(context, fingerprint)
                 log(f"已注入设备指纹 {fingerprint[:12]}…（来源 GLADOS_FP，共 {len(fingerprint)} 字符）")
             elif not use_email:
-                log("未配置 GLADOS_FP，将使用当前浏览器设备信息；"
-                    "如接口明确返回 device-mismatch，再从原已登录浏览器导出实际值。")
+                log("未配置 GLADOS_FP（可选）；原请求没有 Authorization 时无需填写，"
+                    "设备不匹配时先核对原浏览器的 Cookie 和 User-Agent。")
             if cookie:
                 context.add_cookies(_cookie_list(cookie))
                 log(f"已注入 {len(parse_cookie_pairs(cookie))} 个 Cookie 字段（不显示值）。")
@@ -529,10 +529,10 @@ def _fatal_hint(result):
     lowered = message.lower()
     if DEVICE_MISMATCH_MARKER in lowered or "登录设备" in message or "automated" in lowered:
         return (
-            "GLaDOS 用浏览器里的设备指纹（localStorage 的 glados.fp.v1，作为 Authorization "
-            "请求头发送）校验登录设备，runner 上算出来的指纹与登录设备不同，所以被拒。"
-            "请在已经登录 GLaDOS 的网页控制台读取 localStorage.getItem('glados.fp.v1')，"
-            "存为 Secret GLADOS_FP；用 navigator.userAgent 读取同一浏览器的 UA，写入 GLADOS_USER_AGENT。"
+            "服务端拒绝了本次登录设备校验，具体判断规则无法从这条回复确定。"
+            "先核对同一已登录浏览器的完整 Cookie 与 User-Agent。"
+            "GLADOS_FP 仅在原请求实际携带对应 Authorization 时配置；缓存键为 null 不代表必须补填。"
+            "若浏览器手动签到也失败，先按站点提示重新登录再导出会话。"
         )
     if any(marker in message.lower() for marker in AUTH_ERROR_MARKERS) or "没有权限" in message:
         return (

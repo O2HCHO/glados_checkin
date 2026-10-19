@@ -1,9 +1,12 @@
+import io
 import json
 import os
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import random_schedule as schedule
 from glados_cookie import FatalError
@@ -92,20 +95,20 @@ class PlanTests(unittest.TestCase):
         source = schedule.replace_cron(SOURCE, value["cron"])
         self.assertIsNone(schedule.plan_next(value, source, now, repair=True))
 
-    def test_keepalive_repairs_expired_schedule_into_today_with_margin(self):
+    def test_keepalive_preserves_missed_schedule_for_fallback(self):
         value = dict(config(), next_offset_minutes=0, next_run_at="2026-10-17T09:00:00+08:00",
                      cron="0 1 17 10 *")
         rng = Mock()
-        rng.randint.return_value = 8
         updated, _ = schedule.plan_next(value, SOURCE, at("2026-10-18T09:02:01+08:00"), repair=True, rng=rng)
-        rng.randint.assert_called_once_with(8, 90)
-        self.assertEqual(updated["next_run_at"], "2026-10-18T09:08:00+08:00")
+        rng.randint.assert_not_called()
+        self.assertEqual(updated, value)
 
-    def test_keepalive_after_window_repairs_to_tomorrow(self):
+    def test_keepalive_after_window_does_not_discard_today_or_older_missed_run(self):
         value = dict(config(), next_offset_minutes=0, next_run_at="2026-10-17T09:00:00+08:00",
                      cron="0 1 17 10 *")
         updated, _ = schedule.plan_next(value, SOURCE, at("2026-10-18T12:00:00+08:00"), repair=True)
-        self.assertEqual(at(updated["next_run_at"]).date().isoformat(), "2026-10-19")
+        self.assertEqual(updated, value)
+        self.assertTrue(schedule.checkin_due(updated, at("2026-10-18T12:00:00+08:00"))[0])
 
     def test_keepalive_resynchronizes_cron_without_rerandomizing_future_plan(self):
         value = dict(config(), next_offset_minutes=37, next_run_at="2026-10-19T09:37:00+08:00",
@@ -114,6 +117,55 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(updated["next_run_at"], value["next_run_at"])
         self.assertEqual(updated["next_offset_minutes"], 37)
         self.assertEqual(schedule.workflow_cron(source), "37 1 19 10 *")
+
+
+class DueTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = dict(config(), next_offset_minutes=83,
+                         next_run_at="2026-10-19T10:23:00+08:00", cron="23 2 19 10 *")
+
+    def test_scheduled_checks_skip_early_and_run_at_or_after_target(self):
+        for now, due in (("2026-10-19T10:22:59+08:00", False),
+                         ("2026-10-19T10:23:00+08:00", True),
+                         ("2026-10-19T15:40:00+08:00", True),
+                         ("2026-10-20T14:47:00+08:00", True)):
+            with self.subTest(now=now):
+                self.assertEqual(schedule.checkin_due(self.plan, at(now))[0], due)
+
+    def test_successful_run_advances_plan_so_late_triggers_do_not_repeat(self):
+        now = at("2026-10-19T10:23:00+08:00")
+        updated, _ = schedule.plan_next(self.plan, SOURCE, now)
+        for time in ("2026-10-19T14:47:00+08:00", "2026-10-19T19:37:00+08:00"):
+            self.assertFalse(schedule.checkin_due(updated, at(time))[0])
+        self.assertTrue(schedule.checkin_due(updated, now, "workflow_dispatch")[0])
+
+    def test_bootstrap_and_utc_times_are_checked_in_beijing_time(self):
+        self.assertFalse(schedule.checkin_due(config(), at("2026-10-19T00:59:59+00:00"))[0])
+        self.assertTrue(schedule.checkin_due(config(), at("2026-10-19T01:00:00+00:00"))[0])
+        self.assertTrue(schedule.checkin_due(config(), at("2026-10-19T19:37:00+08:00"))[0])
+        with self.assertRaises(FatalError):
+            schedule.checkin_due(config(), at("2026-10-19T09:00:00+08:00"), "push")
+
+    def test_cli_gate_writes_false_without_token_or_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "schedule.json")
+            output_path = Path(directory, "output")
+            summary_path = Path(directory, "summary")
+            config_path.write_text(json.dumps(self.plan), encoding="utf-8")
+            with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule", "GITHUB_OUTPUT": str(output_path),
+                                         "GITHUB_STEP_SUMMARY": str(summary_path)}, clear=True), \
+                    patch.object(schedule, "CONFIG_PATH", str(config_path)), \
+                    patch.object(schedule, "datetime", wraps=datetime) as clock, \
+                    patch.object(schedule, "GitHub") as client, patch.object(schedule, "log"):
+                clock.now.return_value = at("2026-10-19T10:22:00+08:00")
+                self.assertEqual(schedule.main(["--check-due"]), 0)
+                self.assertEqual(output_path.read_text(encoding="utf-8"), "run_checkin=false\n")
+                self.assertIn("尚未到期", summary_path.read_text(encoding="utf-8"))
+                client.assert_not_called()
+                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch"}):
+                    self.assertEqual(schedule.main(["--check-due"]), 0)
+                self.assertTrue(output_path.read_text(encoding="utf-8").endswith("run_checkin=true\n"))
+                client.assert_not_called()
 
 
 class FakeGitHub:
@@ -150,6 +202,34 @@ class FakeGitHub:
 
 
 class RemoteTests(unittest.TestCase):
+    def test_permission_error_reports_operation_without_response_or_token(self):
+        token = "private-token-do-not-print"
+        error = HTTPError("https://api.github.com/repos/owner/repo/git/trees", 403, "Forbidden",
+                          {"X-Accepted-GitHub-Permissions": "contents=write,workflows=write"},
+                          io.BytesIO(json.dumps({"message": "Resource not accessible by personal access token",
+                                                 "private": token}).encode()))
+        with patch.object(schedule, "urlopen", side_effect=error) as request, \
+                patch.object(schedule, "log") as log, self.assertRaises(schedule.APIError) as caught:
+            schedule.GitHub("owner/repo", token).call("POST", "/git/trees", {"private": token})
+        self.assertEqual(caught.exception.status, 403)
+        self.assertIn("创建文件树", str(caught.exception))
+        self.assertIn("contents=write, workflows=write", str(caught.exception))
+        self.assertIn("仓库访问范围不足", str(caught.exception))
+        self.assertNotIn(token, str(caught.exception) + str(log.call_args_list))
+        request.assert_called_once()
+
+    def test_rate_limit_and_non_json_errors_are_safe(self):
+        for headers, body, marker in (({"X-RateLimit-Remaining": "0"}, b"private-body", "额度已用尽"),
+                                      ({}, b"private-body", ""),
+                                      ({}, b'{"message":"Protected branch update failed"}', "分支保护")):
+            error = HTTPError("https://api.github.com/", 403, "Forbidden", headers, io.BytesIO(body))
+            hint = schedule.api_error_hint(error)
+            if marker:
+                self.assertIn(marker, hint)
+            else:
+                self.assertEqual(hint, "")
+            self.assertNotIn("private-body", hint)
+
     def test_config_and_workflow_are_published_in_one_nonforced_commit(self):
         api = FakeGitHub()
         updated = schedule.update_remote(api, "main", at("2026-10-18T09:00:00+08:00"))
@@ -182,6 +262,16 @@ class RemoteTests(unittest.TestCase):
         api = FakeGitHub()
         self.assertIsNone(schedule.update_remote(api, "main", at("2026-10-18T09:00:00+08:00"), repair=True))
         self.assertTrue(all(method == "GET" for method, _, _ in api.calls))
+
+    def test_keepalive_reports_overdue_without_advancing_or_claiming_healthy(self):
+        value = dict(config(), next_offset_minutes=83, next_run_at="2026-10-19T10:23:00+08:00",
+                     cron="23 2 19 10 *")
+        api = FakeGitHub(current=value, source=schedule.replace_cron(SOURCE, value["cron"]))
+        with patch.object(schedule, "log") as log:
+            self.assertIsNone(schedule.update_remote(api, "main", at("2026-10-19T12:48:00+08:00"), repair=True))
+        self.assertTrue(all(method == "GET" for method, _, _ in api.calls))
+        self.assertIn("已到期", str(log.call_args_list))
+        self.assertNotIn("仍有效", str(log.call_args_list))
 
     def test_missing_token_fails_advance_but_does_not_break_keepalive(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(schedule, "GitHub") as client:

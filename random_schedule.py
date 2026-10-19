@@ -2,7 +2,6 @@
 import argparse
 import base64
 import json
-import math
 import os
 import random
 import re
@@ -72,13 +71,32 @@ def replace_cron(source, cron):
     return source[:match.start(2)] + f'{indent}- cron: "{cron}"{newline}' + source[match.end(2):]
 
 
+def checkin_due(config, now, event="schedule"):
+    """用最新排程决定是否执行；固定兜底触发只在签到尚未推进时继续。"""
+    validate_config(config)
+    if event == "workflow_dispatch":
+        return True, "手动触发，立即签到"
+    if event != "schedule":
+        raise FatalError("到期检查仅支持 schedule 或 workflow_dispatch 事件。")
+    now = now.astimezone(BEIJING_TZ)
+    if config["next_run_at"]:
+        target = datetime.fromisoformat(config["next_run_at"])
+    else:
+        hour, minute = map(int, config["base_time"].split(":"))
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(
+            minutes=config["min_offset_minutes"])
+    if now >= target:
+        return True, f"计划 {target.isoformat()} 已到期，立即签到（含延迟或遗漏后的补签）"
+    return False, f"下一次计划 {target.isoformat()} 尚未到期，本次快速退出"
+
+
 def plan_next(config, source, now, repair=False, rng=None):
-    """正常运行安排明天；保活仅修复过去日期或不同步的 cron。"""
+    """实际签到运行后安排明天；保活只修复 cron，不推进尚未执行的排程。"""
     validate_config(config)
     current_cron = workflow_cron(source)
     now = now.astimezone(BEIJING_TZ)
     planned = datetime.fromisoformat(config["next_run_at"]) if config["next_run_at"] else None
-    if repair and (planned is None or planned.date() >= now.date()):
+    if repair:
         expected = cron_for(planned) if planned else config["cron"]
         if current_cron == expected and config["cron"] == expected:
             return None
@@ -89,11 +107,6 @@ def plan_next(config, source, now, repair=False, rng=None):
     today_base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     low, high = config["min_offset_minutes"], config["max_offset_minutes"]
     target_base = today_base + timedelta(days=1)
-    if repair:
-        # 恢复遗漏的排程时，尽量安排在今天尚未过去的窗口，预留 5 分钟供 GitHub 更新。
-        earliest = max(low, math.ceil((now + timedelta(minutes=5) - today_base).total_seconds() / 60))
-        if earliest <= high:
-            target_base, low = today_base, earliest
     offset = (rng or random.SystemRandom()).randint(low, high)
     target = target_base + timedelta(minutes=offset)
     cron = cron_for(target)
@@ -102,9 +115,52 @@ def plan_next(config, source, now, repair=False, rng=None):
 
 
 class APIError(RuntimeError):
-    def __init__(self, status):
+    def __init__(self, status, operation="GitHub API", hint=""):
         self.status = status
-        super().__init__(f"GitHub API HTTP {status}")
+        self.operation, self.hint = operation, hint
+        super().__init__(f"{operation}：GitHub HTTP {status}" + (f"；{hint}" if hint else ""))
+
+
+def api_operation(method, path):
+    # 只输出固定操作名称，不记录请求头、分支参数或请求/响应正文。
+    for verb, prefix, label in (
+        ("GET", "/git/ref/heads/", "读取默认分支"),
+        ("GET", "/contents/config/schedule.json", "读取排程配置"),
+        ("GET", "/contents/.github/workflows/checkin.yml", "读取工作流"),
+        ("GET", "/git/commits/", "读取提交"),
+        ("POST", "/git/trees", "创建文件树"),
+        ("POST", "/git/commits", "创建提交"),
+        ("PATCH", "/git/refs/heads/", "更新默认分支"),
+    ):
+        if method == verb and path.startswith(prefix):
+            return label
+    return "GitHub API"
+
+
+def api_error_hint(error):
+    headers = error.headers or {}
+    hints = []
+    if headers.get("X-RateLimit-Remaining") == "0":
+        hints.append("GitHub API 额度已用尽，请等待额度恢复")
+    # 官方权限提示只保留本脚本相关的已知权限，避免输出任意响应内容。
+    permissions = re.findall(r"\b(contents|workflows|metadata)=(read|write|admin)\b",
+                             headers.get("X-Accepted-GitHub-Permissions", ""))
+    if permissions:
+        hints.append("接口权限提示：" + ", ".join(dict.fromkeys(f"{key}={value}" for key, value in permissions)))
+    try:
+        body = json.loads(error.read(16384))
+        message = str(body.get("message", "")).lower() if isinstance(body, dict) else ""
+    except (ValueError, OSError):
+        message = ""
+    if "resource not accessible by personal access token" in message:
+        hints.append("个人 Token 的权限或仓库访问范围不足")
+    elif "workflow" in message and "refusing" in message:
+        hints.append("Token 缺少修改工作流所需的 Workflows 写权限")
+    elif any(marker in message for marker in ("protected branch", "repository rule", "rule violations")):
+        hints.append("仓库分支保护或规则拒绝直接提交，请检查规则要求")
+    elif "rate limit" in message and headers.get("X-RateLimit-Remaining") != "0":
+        hints.append("GitHub API 限流，请稍后重试")
+    return "；".join(hints)
 
 
 class GitHub:
@@ -116,6 +172,8 @@ class GitHub:
         SECRET_VALUES.add(token)
 
     def call(self, method, path, payload=None):
+        operation = api_operation(method, path)
+        log(f"GitHub API：{operation}。")
         request = Request(self.root + path,
                           data=json.dumps(payload).encode("utf-8") if payload is not None else None,
                           method=method, headers={"Authorization": f"Bearer {self.token}",
@@ -127,7 +185,11 @@ class GitHub:
             with urlopen(request, timeout=30) as response:
                 return json.load(response)
         except HTTPError as exc:
-            raise APIError(exc.code) from None
+            try:
+                hint = api_error_hint(exc)
+            finally:
+                exc.close()
+            raise APIError(exc.code, operation, hint) from None
         except (OSError, URLError, ValueError):
             raise FatalError("连接 GitHub API 失败；未确认排程更新，请查看仓库中的 config。") from None
 
@@ -146,7 +208,10 @@ def update_remote(api, branch, now, repair=False):
         source = api.text_at(WORKFLOW_PATH, head)
         result = plan_next(config, source, now, repair)
         if result is None:
-            log("随机排程仍有效，无需修改。")
+            due, reason = checkin_due(config, now)
+            log(("WARNING: " if due else "") + reason +
+                ("；保活只检查配置，到期任务由签到工作流的主触发或固定兜底执行。" if due
+                 else "；cron 已同步，无需修改。"))
             return None
         updated, workflow = result
         tree_sha = api.call("GET", "/git/commits/" + head)["tree"]["sha"]
@@ -174,11 +239,27 @@ def update_remote(api, branch, now, repair=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repair", action="store_true", help="仅修复过期或不同步的排程（保活用）")
+    parser.add_argument("--repair", action="store_true", help="仅同步现有计划的 cron，不推进未执行的排程（保活用）")
     parser.add_argument("--preview", action="store_true", help="只根据本地配置预览，不写文件或访问 GitHub")
+    parser.add_argument("--check-due", action="store_true", help="只检查本次是否到期，写入 GITHUB_OUTPUT；无需 Token")
     args = parser.parse_args(argv)
     try:
         now = datetime.now(BEIJING_TZ)
+        if args.check_due:
+            if args.preview or args.repair:
+                raise FatalError("--check-due 不能与 --preview 或 --repair 混用。")
+            with open(CONFIG_PATH, encoding="utf-8") as handle:
+                due, reason = checkin_due(json.load(handle), now, get_env("GITHUB_EVENT_NAME", "schedule"))
+            log(reason)
+            output = get_env("GITHUB_OUTPUT")
+            if output:
+                with open(output, "a", encoding="utf-8") as handle:
+                    handle.write(f"run_checkin={str(due).lower()}\n")
+            summary = get_env("GITHUB_STEP_SUMMARY")
+            if summary:
+                with open(summary, "a", encoding="utf-8") as handle:
+                    handle.write(f"\n排程检查：{reason}。\n")
+            return 0
         if args.preview:
             with open(CONFIG_PATH, encoding="utf-8") as handle:
                 config = json.load(handle)
@@ -205,7 +286,7 @@ def main(argv=None):
                              f"随机偏移 {updated['next_offset_minutes']} 分钟；无需 runner 等待。\n")
         return 0
     except APIError as exc:
-        log(f"ERROR: 排程更新失败（GitHub HTTP {exc.status}）；检查 SCHEDULE_TOKEN 的权限、有效期和默认分支保护。")
+        log(f"ERROR: 排程更新失败：{exc}；检查 SCHEDULE_TOKEN 的仓库范围、Contents/Workflows 写权限和默认分支规则。")
     except (FatalError, ValueError, KeyError, OSError) as exc:
         log(f"ERROR: 排程更新失败：{exc}")
     return 1

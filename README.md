@@ -1,7 +1,9 @@
 # GLaDOS 自动签到（Cookie 接口 / 浏览器）
 
-默认复用已有 Cookie，通过 GitHub Actions 在北京时间 **09:00–10:30** 的随机时刻启动并立即签到。
+默认复用已有 Cookie，通过 GitHub Actions 安排在北京时间 **09:00–10:30** 的随机时刻签到。
 每次结束后生成下一次时间，保存到 `config/schedule.json` 并同步工作流 cron，不让 runner 随机空等。
+GitHub 定时触发可能延迟或丢失；另设北京时间 **14:47、19:37** 的轻量兜底检查，
+仅在已保存的计划到期但尚未推进时补签，正常完成后直接退出。
 随机排程需要配置下文的 `SCHEDULE_TOKEN`；它与 GLaDOS 登录凭据相互独立。
 
 ## 推荐：复用 Cookie 调用签到接口
@@ -24,7 +26,7 @@
 | `GLADOS_CHECKIN_METHOD` | Variable，可选 | `api`（默认）；`browser` 则复用 Cookie 用浏览器点击 |
 | `GLADOS_COOKIE` | Secret | 已登录浏览器中复制的完整 Cookie 请求头 |
 | `GLADOS_CHECKIN_TOKEN` | Variable，可选 | 默认 `glados.cloud`；旧值 `glados.one` 会自动纠正 |
-| `GLADOS_FP` | Secret，可选 | 仅在需要设备校验时填写同一已登录浏览器的真实缓存指纹 |
+| `GLADOS_FP` | Secret，可选 | 仅在原浏览器请求确实携带 `fp1.` 开头的 Authorization 时填写对应值；没有就留空 |
 | `GLADOS_USER_AGENT` | Variable，可选 | 同一登录浏览器的完整 User-Agent |
 
 Cookie 获取步骤：
@@ -41,14 +43,28 @@ Cookie 支持完整单行请求头、带 `Cookie:` 前缀、外层引号或单�
 Cookie 是登录凭据，只保存到 Secret，不提交到仓库，也不要贴到聊天中。
 Cookie 失效后需要在浏览器重新登录、更新 Secret；脚本不会静默切回邮箱模式反复申请验证码。
 
-若接口明确返回 **`device-mismatch`**，在**刚才导出 Cookie 的已登录网页**控制台读取：
+若接口明确返回 **`device-mismatch`**，先核对 **同一已登录浏览器** 的完整 Cookie 与 UA。
+UA 可从该请求的 Request Headers → User-Agent 复制，也可在网页控制台读取：
 
 ```javascript
-localStorage.getItem('glados.fp.v1') // 完整结果存为 Secret GLADOS_FP
 navigator.userAgent                // 完整结果存为 Variable GLADOS_USER_AGENT
 ```
 
-三个值来自同一登录浏览器。`print_fingerprint.py` 会新建独立浏览器，不能导出你原浏览器
+`GLADOS_USER_AGENT` 在本工作流中从 **Variables** 读取，放在 Secrets 中不会生效。
+运行日志会显示 UA 与 FP 是否已配置，不显示实际凭据。
+
+**找不到 Authorization，且 `localStorage.getItem('glados.fp.v1')` 返回 `null` 时，
+不要填写 GLADOS_FP，更不要把字面量 `null` 当作值。** 2026-10-18 检查公开前端代码发现，
+`/login` 加载的 `app.bundle.js` 有缓存指纹并设置 Authorization 的逻辑，
+而 `/console` 加载的另一套前端，其 API 请求拦截器没有这段逻辑；因此这个字段并非所有页面都有。
+这也不能反向证明服务端没有其他设备校验。只有原浏览器请求实际发送对应字段时才配置它。
+
+更新 UA 后可手动运行一次工作流。若仍返回设备不匹配，在原浏览器手动签到核实：
+浏览器也失败时按站点提示重新登录，再复制新 Cookie；浏览器成功但 Actions 失败时，
+对比 `/api/user/checkin` 的回复，尤其是 `loginDevice` 和 `currentDevice`（如果返回），
+以及该请求实际携带的头。读取 `/api/user/status` 成功只能确认登录态，不能确认签到通过设备校验。
+
+`print_fingerprint.py` 会新建独立浏览器，不能导出你原浏览器
 已有的登录缓存，因此其探测值不能与原浏览器 Cookie 混用。
 `没有权限` 本身不能证明 TLS/浏览器指纹有问题，更不能据此认定所有 koa Cookie 已失效。
 旧版 `diag_status.py` 曾漏发 Cookie，会造成“没有权限”的误判；现已补齐请求头并加入回归测试。
@@ -87,7 +103,7 @@ navigator.userAgent                // 完整结果存为 Variable GLADOS_USER_AG
 | --- | --- |
 | 发码接口 `captcha_required` | 本次邮箱登录需要人工验证；可复用手动登录后的有效 Cookie |
 | Cookie API `没有权限` / `code=-2` | 本次会话未被接受，检查是否复制完整、是否已过期或被吊销 |
-| 签到接口 `device-mismatch` | 核对同一登录浏览器的 Cookie、缓存指纹和 UA |
+| 签到接口 `device-mismatch` | 先核对同一登录浏览器的 Cookie 与 UA；Authorization/FP 仅在原请求确实存在时配置 |
 | `please checkin via ...` | 核对签到 token，当前默认 `glados.cloud` |
 | `未配置 SCHEDULE_TOKEN` | 随机排程未启用，需要独立配置 GitHub Token；不代表邮箱或 Cookie 错误 |
 | `未配置完整 SMTP` | 未启用失败邮件通知，与 QQ IMAP 或签到认证是否成功无关 |
@@ -97,9 +113,16 @@ navigator.userAgent                // 完整结果存为 Variable GLADOS_USER_AG
 
 ## 随机签到时间
 
-每次手动或定时运行都立即签到。无论本次签到成功或失败，任务都会尝试为**明天**选择一个
+每次手动或已到期的定时运行都立即签到。无论本次签到成功或失败，任务都会尝试为**明天**选择一个
 随机分钟偏移，原子提交 `config/schedule.json` 和 `.github/workflows/checkin.yml`，
 并在日志与运行摘要中展示下一次时间。正常运行之间不会占用 runner 等待。
+
+工作流先读取最新分支的 config 判断是否到期，手动触发始终立即执行。
+定时主触发或固定兜底到达时，如果 config 已安排到明天，就跳过 Python 环境配置、
+依赖安装、测试、GLaDOS 请求和排程提交；兜底仍需启动 runner 进行短暂检查，不能算零用量。
+如果今天的主触发延迟或丢失，兜底会立即补签，不在 runner 中等待。
+并发运行由同一组串行处理，后到的触发读取已推进的最新计划，避免重复签到。
+只有实际执行过签到步骤后才推进下次时间；安装依赖等前置步骤失败不会把未执行的计划顺延到明天。
 
 GitHub 的 `on.schedule` 使用静态 cron，不能在触发前动态读取仓库文件，
 所以脚本会把 config 的时间同步成 UTC cron；cron 同时指定下一次的日/月，
@@ -140,14 +163,26 @@ GitHub 的 `on.schedule` 使用静态 cron，不能在触发前动态读取仓�
 5. 同步最新代码到默认分支，手动 **Run workflow** 一次，确认 **Save the next random checkin time** 步骤成功，仓库 config 与 cron 已自动更新。
 
 Token 的有效期按你的账号策略设置，到期需更新 Secret；它不替代邮箱授权码。
+
+若配置后仍然标红，先看失败的具体步骤：签到成功而 `Save the next random checkin time`
+返回 **GitHub HTTP 403**，说明随机排程请求被 GitHub 拒绝，不能据此判断 Cookie 登录失败。
+确认 Token 的 Resource owner 为仓库拥有者、Repository access 包含本仓库，
+且 **Contents 是 Read and write，Workflows 是 Write（或界面显示的 Read and write）**。
+Actions 权限不能替代上述权限。在 Token 设置页修改权限并保存后重跑；如果重新生成了 Token，
+还要更新仓库中 `SCHEDULE_TOKEN` 的 Secret 值。
+新日志会显示具体失败操作（读取配置、创建文件树、创建提交或更新分支）和 GitHub 返回的
+已知权限提示。403 也可能来自限流或仓库策略，需要结合该提示判断；不会输出 Token 或响应正文。
+
 权限依据：[GitHub Token 创建说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)、
 [工作流文件写权限](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)。
 若默认分支保护阻止该 Token 直接提交，排程更新会失败；脚本不会强推或绕过分支保护。
 
 缺少 Token 或更新失败时，本次签到仍会执行，但排程步骤报错，远程原 cron 不变。
-原有保活工作流每天检查一次：若已安排的日期早于今天，会尝试补排到今天尚可用的窗口，
-窗口已过则安排明天；待执行的今天排程不会因 GitHub 延迟而被提前改写。
-保活修复同样需要有效 Token；更新失败需要根据日志修正权限/有效期。
+原有保活工作流每天检查一次，只修复 config 与主 cron 的同步，不推进未执行的计划。
+若计划时间已过，会明确记录“已到期”并保留计划，由签到工作流的固定兜底补签，
+不会再把错过的日期报告为“排程仍有效”，也不会在尚未签到时直接顺延到明天。
+同步修复同样需要有效 Token；更新失败需要根据日志修正权限/有效期。
+固定兜底也依赖 GitHub 自身的调度，不能保证精确到点或绝不漏跑。
 GitHub 的调度仍可能延迟或遗漏，设置的分钟不能保证准点到达。
 
 每日自动提交只修改 config 和 cron 标记块，并保留其他文件；遇到并发提交会重新读取默认分支，
