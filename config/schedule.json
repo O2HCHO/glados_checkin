@@ -2,7 +2,7 @@
   "base_time": "09:00",
   "min_offset_minutes": 0,
   "max_offset_minutes": 90,
-  "next_offset_minutes": 86,
-  "next_run_at": "2026-10-21T10:26:00+08:00",
-  "cron": "26 2 21 10 *"
+  "next_offset_minutes": 61,
+  "next_run_at": "2026-10-22T10:01:00+08:00",
+  "cron": "1 2 22 10 *"
 }
