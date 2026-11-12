@@ -182,9 +182,9 @@ class ClassifyPayloadTests(unittest.TestCase):
     def test_non_dict_payload_is_retryable(self):
         self.assertEqual(classify_payload(["nope"]).status, "retryable")
 
-    def test_automation_detection_is_retryable(self):
+    def test_automation_detection_is_fatal(self):
         self.assertEqual(classify_payload({"code": 1, "message": "Automated check-in detected"}).status,
-                         "retryable")
+                         "fatal")
 
     def test_page_state_fallbacks(self):
         self.assertTrue(classify_page_state("Checkin repeats! Please try tomorrow").ok)
@@ -288,6 +288,17 @@ class AttemptTests(unittest.TestCase):
                         body_text="Points 33", disabled_after_click=False)
         with self.assertRaises(browser_checkin.RetryableError):
             browser_checkin._attempt(page, None)
+
+    def test_disabled_button_without_completion_remains_retryable(self):
+        page = FakePage(disabled=True, text="Checkin", body_text="Loading")
+        self.assertEqual(browser_checkin._attempt(page, None).status, "retryable")
+
+    def test_automation_rejection_on_page_does_not_retry(self):
+        page = FakePage(selector_error=TimeoutError("no button"), body_text="Automated check-in detected")
+        with patch.object(browser_checkin.time, "sleep") as sleep:
+            result = browser_checkin._checkin_with_retry(page, 2, 0)
+        self.assertEqual(result.status, "fatal")
+        sleep.assert_not_called()
 
     def test_click_timeout_with_button_now_disabled_is_already(self):
         page = FakePage(click_error=TimeoutError("timeout"), text="Checkin",

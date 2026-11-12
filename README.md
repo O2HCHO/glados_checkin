@@ -1,18 +1,13 @@
 # GLaDOS 自动签到（Cookie 接口 / 浏览器）
 
-默认复用已有 Cookie，通过 GitHub Actions 安排在北京时间 **09:00–10:30** 的随机时刻签到。
-每次结束后生成下一次时间，保存到 `config/schedule.json` 并同步工作流 cron，不让 runner 随机空等。
-GitHub 定时触发可能延迟或丢失；另设北京时间 **14:47、19:37** 的轻量兜底检查，
-仅在已保存的计划到期但尚未推进时补签，正常完成后直接退出。
-随机排程需要配置下文的 `SCHEDULE_TOKEN`；它与 GLaDOS 登录凭据相互独立。
+默认复用已有 Cookie，通过 GitHub Actions 每天在北京时间 **09:30** 触发签到，也支持手动运行。
 
 ## 推荐：复用 Cookie 调用签到接口
 
-参考 [pyx13638516490/glados_checkin 的接口流程](https://github.com/pyx13638516490/glados_checkin/blob/main/checkin.py)，
-本项目提供 Cookie API 模式，向 `https://glados.cloud/api/user/checkin` 发送
-`{"token":"glados.cloud"}`，验证响应后查询会员天数与积分。此模式不重新登录、不申请邮箱验证码，
-也不安装或启动 Chromium；临时网络故障最多重试一次，业务拒绝不会盲目重发。
-仅请求 `glados.cloud`，不自动把 Cookie 转发到其他域名。
+Cookie API 模式先从 `glados.cloud` 获取一次性签到校验，再用同一会话向同一域名提交签到，
+成功后查询会员天数和积分余额。临时网络故障最多重试一次，每次使用新的校验。
+会话、设备或自动化请求被服务端拒绝时，停止并提示人工检查。此模式可直接复用已有会话，无需 Chromium。
+新版流程参照 [lankerr/2026-glados-checkin 的 Issue #28](https://github.com/lankerr/2026-glados-checkin/issues/28)。
 
 登录风控与已有会话签到是不同步骤：邮箱发码接口返回 `captcha_required`，
 只说明本次申请验证码需要人机验证；有效 Cookie 可以复用已有登录态。
@@ -105,89 +100,19 @@ navigator.userAgent                // 完整结果存为 Variable GLADOS_USER_AG
 | Cookie API `没有权限` / `code=-2` | 本次会话未被接受，检查是否复制完整、是否已过期或被吊销 |
 | 签到接口 `device-mismatch` | 先核对同一登录浏览器的 Cookie 与 UA；Authorization/FP 仅在原请求确实存在时配置 |
 | `please checkin via ...` | 核对签到 token，当前默认 `glados.cloud` |
-| `未配置 SCHEDULE_TOKEN` | 随机排程未启用，需要独立配置 GitHub Token；不代表邮箱或 Cookie 错误 |
+| `Automated check-in detected` / `captcha_required` | 服务端拒绝本次签到，请在官网手动处理 |
+| `Checkin! Got 1 Points` | 服务端确认本次签到获得 1 积分，可在官网积分流水核对 |
 | `未配置完整 SMTP` | 未启用失败邮件通知，与 QQ IMAP 或签到认证是否成功无关 |
 
 本地 Python 需要可用的 SSL/TLS；CI 使用 Python 3.12。Cookie API 只依赖 `requirements.txt`；
 邮箱模式和浏览器点击备选还需要 `requirements-browser.txt` 与 Chromium 或已安装的 Chrome/Edge。
 
-## 随机签到时间
+## 固定排程与迁移
 
-每次手动或已到期的定时运行都立即签到。无论本次签到成功或失败，任务都会尝试为**明天**选择一个
-随机分钟偏移，原子提交 `config/schedule.json` 和 `.github/workflows/checkin.yml`，
-并在日志与运行摘要中展示下一次时间。正常运行之间不会占用 runner 等待。
-
-工作流先读取最新分支的 config 判断是否到期，手动触发始终立即执行。
-定时主触发或固定兜底到达时，如果 config 已安排到明天，就跳过 Python 环境配置、
-依赖安装、测试、GLaDOS 请求和排程提交；兜底仍需启动 runner 进行短暂检查，不能算零用量。
-如果今天的主触发延迟或丢失，兜底会立即补签，不在 runner 中等待。
-并发运行由同一组串行处理，后到的触发读取已推进的最新计划，避免重复签到。
-只有实际执行过签到步骤后才推进下次时间；安装依赖等前置步骤失败不会把未执行的计划顺延到明天。
-
-GitHub 的 `on.schedule` 使用静态 cron，不能在触发前动态读取仓库文件，
-所以脚本会把 config 的时间同步成 UTC cron；cron 同时指定下一次的日/月，
-避免改成今天较晚的时间后当天再次触发。首次部署保留北京时间 09:00 的每日启动入口，
-第一次运行完成后才切换为指定日期的随机触发。
-参见 [GitHub 调度说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
-
-随机范围在 `config/schedule.json` 中修改：
-
-```json
-{
-  "base_time": "09:00",
-  "min_offset_minutes": 0,
-  "max_offset_minutes": 90,
-  "next_offset_minutes": null,
-  "next_run_at": null,
-  "cron": "0 1 * * *"
-}
-```
-
-上面是首次部署的初始状态。你只需要修改前三项：基准时间按北京时间填写，
-偏移需满足 `0 <= min <= max <= 120`，且窗口不能跨过午夜。
-后三项由脚本维护；例如随机到 `37`，会保存明天 `09:37:00+08:00`，同时生成对应 cron。
-修改范围后可手动运行一次签到，使新范围应用到下一次排程。
-原来的 `GLADOS_JITTER_MIN_MINUTES`、`GLADOS_JITTER_MAX_MINUTES` 已不再使用，
-`--no-jitter` 仍兼容旧命令，但现在不加这个参数也不会随机等待。
-网络/接口故障后的短暂重试仍保留。
-
-### 一次性配置 SCHEDULE_TOKEN
-
-自动改写工作流需要额外的工作流写权限，默认 `GITHUB_TOKEN` 不足以完成该操作。
-创建仅限这个仓库的 fine-grained personal access token：
-
-1. GitHub 右上角头像 → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**。
-2. **Resource owner** 选择仓库所属账号；**Repository access** 选 **Only select repositories**，只勾选 `glados_checkin`。
-3. **Repository permissions** 设置 **Contents: Read and write**、**Workflows: Read and write**；Metadata 保持自动的 Read。
-4. 生成 Token，把它保存到签到仓库 **Settings → Secrets and variables → Actions → Secrets → New repository secret**，名称为 **`SCHEDULE_TOKEN`**，值仅填写 Token 本身。
-5. 同步最新代码到默认分支，手动 **Run workflow** 一次，确认 **Save the next random checkin time** 步骤成功，仓库 config 与 cron 已自动更新。
-
-Token 的有效期按你的账号策略设置，到期需更新 Secret；它不替代邮箱授权码。
-
-若配置后仍然标红，先看失败的具体步骤：签到成功而 `Save the next random checkin time`
-返回 **GitHub HTTP 403**，说明随机排程请求被 GitHub 拒绝，不能据此判断 Cookie 登录失败。
-确认 Token 的 Resource owner 为仓库拥有者、Repository access 包含本仓库，
-且 **Contents 是 Read and write，Workflows 是 Write（或界面显示的 Read and write）**。
-Actions 权限不能替代上述权限。在 Token 设置页修改权限并保存后重跑；如果重新生成了 Token，
-还要更新仓库中 `SCHEDULE_TOKEN` 的 Secret 值。
-新日志会显示具体失败操作（读取配置、创建文件树、创建提交或更新分支）和 GitHub 返回的
-已知权限提示。403 也可能来自限流或仓库策略，需要结合该提示判断；不会输出 Token 或响应正文。
-
-权限依据：[GitHub Token 创建说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)、
-[工作流文件写权限](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)。
-若默认分支保护阻止该 Token 直接提交，排程更新会失败；脚本不会强推或绕过分支保护。
-
-缺少 Token 或更新失败时，本次签到仍会执行，但排程步骤报错，远程原 cron 不变。
-原有保活工作流每天检查一次，只修复 config 与主 cron 的同步，不推进未执行的计划。
-若计划时间已过，会明确记录“已到期”并保留计划，由签到工作流的固定兜底补签，
-不会再把错过的日期报告为“排程仍有效”，也不会在尚未签到时直接顺延到明天。
-同步修复同样需要有效 Token；更新失败需要根据日志修正权限/有效期。
-固定兜底也依赖 GitHub 自身的调度，不能保证精确到点或绝不漏跑。
-GitHub 的调度仍可能延迟或遗漏，设置的分钟不能保证准点到达。
-
-每日自动提交只修改 config 和 cron 标记块，并保留其他文件；遇到并发提交会重新读取默认分支，
-不使用强制更新。你在本地修改仓库前先拉取远程更新，避免和自动排程提交冲突。
-本地可用 `python random_schedule.py --preview` 预览下一次时间，该命令不访问 GitHub，也不保存改动。
+签到工作流每天按 UTC 01:30 调度（北京时间 09:30），实际开始时间取决于 GitHub Actions。
+更新默认分支后，可移除旧的 `SCHEDULE_TOKEN` Secret。如果该令牌只用于旧排程，也可以撤销它。
+在 Actions 的 **GLaDOS Checkin → Run workflow** 可立即触发一次。若要核对奖励，请在当天首次签到时执行，
+对照签到消息和官网积分流水。实际积分由 GLaDOS 决定。
 
 ## 配置项
 
@@ -198,12 +123,20 @@ GitHub 的调度仍可能延迟或遗漏，设置的分钟不能保证准点到�
 | `GLADOS_COOKIE` | Secret | 必填；完整 Cookie |
 | `GLADOS_FP` | Secret | 可选；明确出现设备不匹配时，从同一登录网页读取的真实缓存值 |
 | `GLADOS_USER_AGENT` | Variable | 可选；同一登录浏览器的完整 UA |
-| `SCHEDULE_TOKEN` | Secret | 自动保存下次随机触发时间；仅本仓库 Contents/Workflows 读写权限 |
+| `PUSHPLUS_TOKEN` | Secret | 可选，PushPlus 推送 Token |
+| `SERVERCHAN_SENDKEY` | Secret | 可选，Server 酱 Turbo 或 Server 酱³ 的 SendKey |
+| `TELEGRAM_BOT_TOKEN` | Secret | 可选，Telegram Bot Token，与 `TELEGRAM_CHAT_ID` 一起配置 |
+| `TELEGRAM_CHAT_ID` | Secret | 可选，接收通知的 Telegram 聊天 ID |
+| `PUSH_LEVEL` | Variable | Actions 默认 `all`，每次运行均推送。设为 `fail_only` 时仅推送失败 |
 
 本地还可以用 `GLADOS_FP_FILE` 指向存放指纹的文件（省去复制粘贴），
 以及 `GLADOS_BROWSER_CHANNEL=chrome|msedge` 复用系统浏览器。
 
-失败邮件沿用旧配置（可留空）：`SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` /
+可同时启用多个推送渠道。要接收 Server 酱的微信汇报，把 SendKey 保存为 `SERVERCHAN_SENDKEY` Secret。
+汇报包含脱敏账号、本次奖励和积分余额、剩余天数、官网提供的兑换选项、北京时间及运行链接。
+兑换选项仅供查看。本地直接运行时，`PUSH_LEVEL` 默认是 `fail_only`。
+`--dry-run` 跳过通知。未配置任何推送渠道时，失败邮件沿用旧 SMTP 配置（可留空）：
+`SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` /
 `SMTP_PASSWORD` / `SMTP_USE_SSL` / `MAIL_TO` / `MAIL_FROM`。
 邮件正文只包含脱敏后的错误说明与 Actions 链接，不含 Cookie。
 
@@ -226,9 +159,9 @@ GitHub 的调度仍可能延迟或遗漏，设置的分钟不能保证准点到�
 
 ## 结果与退出码
 
-- `code=0`，或 `Checkin!`、`Checkin Repeats! Please Try Tomorrow`、
-  `Today's observation logged` → 成功（含今日已签到）；
-- 按钮处于 `disabled`/`is-done`（站点自身"已完成"状态）→ 按今日已签到处理；
+- `Checkin! Got … Points` 表示本次签到成功，消息中的分值为本次奖励。
+- `Checkin Repeats! Please Try Tomorrow` 或 `Today's observation logged` 表示今日已签到。
+- 按钮同时处于 `disabled` 和 `is-done` 状态时，按今日已签到处理。
 - `没有权限` / `HTTP 401/403` → 致命：检查 Cookie 是否被接受或站点是否要求验证；
 - `code=4` 且 `reason=device-mismatch` → 致命：指纹/UA 需要与登录设备对齐；
 - 超时、429、5xx → Cookie API 最多请求两次（间隔 5 秒）；浏览器模式按原有 60 秒间隔重试。
@@ -266,6 +199,5 @@ $env:GLADOS_COOKIE='gld:sess=...; gld:sess.sig=...'
 ## 定时任务与保活
 
 工作流支持手动 `Run workflow` 测试；`concurrency` 保证不会同时跑两个签到。
-保活工作流每天北京时间 08:17 唤醒，仍保留每 45 天提交一次空提交的行为，
-并检查随机排程是否过期；过期时使用 `SCHEDULE_TOKEN` 修复。
+保活工作流每天北京时间 08:17 检查最近一次提交，距离上次提交至少 45 天时创建空提交。
 空提交保活需要仓库 Settings → Actions → General → Workflow permissions 开启 Read and write。

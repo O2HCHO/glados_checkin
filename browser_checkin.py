@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime
 
+from checkin_report import ACCOUNT_ENDPOINTS, record_account
 from email_login import QQMailbox, email_mode, login as login_with_email
 from glados_cookie import (
     BEIJING_TZ,
@@ -63,6 +64,8 @@ AUTH_ERROR_PAGE_MARKERS = AUTH_ERROR_MARKERS + (
     "no permission", "permission denied", "forbidden", "login expired",
 )
 AUTOMATION_MARKERS = ("automated check-in", "automated checkin", "automation detected")
+CAPTCHA_MARKERS = ("captcha required", "captcha_required", "人机验证")
+REWARD_PATTERN = re.compile(r"\bcheckin!\s+got\s+([0-9]+(?:\.[0-9]+)?)\s+points?\b", re.I)
 
 
 class CheckinResult:
@@ -73,10 +76,33 @@ class CheckinResult:
         self.message = message
         self.payload = payload or {}
         self.source = source
+        self.account = {}
 
     @property
     def ok(self):
         return self.status in ("success", "already")
+
+    @property
+    def earned_points(self):
+        match = REWARD_PATTERN.search(self.message) if self.status == "success" else None
+        return match.group(1) if match else None
+
+
+def rejection_message(payload):
+    lowered = str(payload.get("message", "")).lower()
+    reason = str(payload.get("reason", "")).strip().lower()
+    code = payload.get("code")
+    if payload.get("captcha_required") or reason == "captcha_required" or any(
+        marker in lowered for marker in CAPTCHA_MARKERS
+    ):
+        return "签到要求人机验证，请在官网手动处理。"
+    if reason == DEVICE_MISMATCH_MARKER or (code == 4 and "mismatch" in reason):
+        return "登录设备不匹配（device-mismatch）。"
+    if any(marker in lowered or marker in reason for marker in AUTOMATION_MARKERS):
+        return "服务端拒绝自动签到（Automated check-in detected），请在官网手动处理。"
+    if any(marker in lowered for marker in AUTH_ERROR_PAGE_MARKERS) or code == -2:
+        return "会话未被接受，请在浏览器手动登录后更新完整 GLADOS_COOKIE。"
+    return None
 
 
 def classify_payload(payload):
@@ -86,26 +112,13 @@ def classify_payload(payload):
     code = payload.get("code")
     message = str(payload.get("message", "")).strip()
     lowered = message.lower()
-    reason = str(payload.get("reason", "")).strip().lower()
-
-    if reason == DEVICE_MISMATCH_MARKER or (code == 4 and "mismatch" in reason):
-        return CheckinResult("fatal", message or "登录设备不匹配", payload, "api")
-
-    if any(marker in message for marker in AUTH_ERROR_MARKERS) or code == -2:
-        return CheckinResult("fatal", message or "会话未被接受", payload, "api")
-
-    if code == 0:
-        if any(marker in lowered for marker in ALREADY_CHECKED_IN_MARKERS):
-            return CheckinResult("already", message, payload, "api")
-        return CheckinResult("success", message, payload, "api")
-
-    if any(marker in lowered for marker in SUCCESS_MARKERS):
-        return CheckinResult("success", message, payload, "api")
+    rejection = rejection_message(payload)
+    if rejection:
+        return CheckinResult("fatal", rejection, payload, "api")
     if any(marker in lowered for marker in ALREADY_CHECKED_IN_MARKERS):
         return CheckinResult("already", message, payload, "api")
-
-    if any(marker in lowered for marker in AUTOMATION_MARKERS):
-        return CheckinResult("retryable", message or "被识别为自动化请求", payload, "api")
+    if code == 0 or any(marker in lowered for marker in SUCCESS_MARKERS):
+        return CheckinResult("success", message, payload, "api")
 
     return CheckinResult("retryable", message or f"未知回复 code={code}", payload, "api")
 
@@ -115,14 +128,13 @@ def classify_page_state(text, payload=None):
     if payload:
         return classify_payload(payload)
     lowered = (text or "").lower()
+    rejection = rejection_message({"message": text})
+    if rejection:
+        return CheckinResult("fatal", rejection, source="dom")
     if any(marker in lowered for marker in ALREADY_CHECKED_IN_MARKERS):
         return CheckinResult("already", text.strip()[:200], source="dom")
     if any(marker in lowered for marker in SUCCESS_MARKERS):
         return CheckinResult("success", text.strip()[:200], source="dom")
-    if any(marker in lowered for marker in AUTH_ERROR_PAGE_MARKERS):
-        return CheckinResult("fatal", text.strip()[:200], source="dom")
-    if any(marker in lowered for marker in AUTOMATION_MARKERS):
-        return CheckinResult("retryable", text.strip()[:200], source="dom")
     return CheckinResult("retryable", "没有捕获到签到接口回复，页面也没有结果文案", source="dom")
 
 
@@ -247,7 +259,8 @@ def _page_text(page, limit=2000):
 
 def read_account(page):
     """用浏览器会话读会员天数与积分；展示失败不影响签到结论。"""
-    for path, field in (("/api/user/status", "leftDays"), ("/api/user/points", "points")):
+    account = {}
+    for path, field in ACCOUNT_ENDPOINTS:
         try:
             response = page.request.get(
                 f"https://glados.cloud{path}",
@@ -264,11 +277,11 @@ def read_account(page):
             if data.get("code") not in (0, None):
                 log(f"WARNING: {path} code={data.get('code')}；签到结果保持成功。")
                 continue
-            container = data.get("data") if isinstance(data.get("data"), dict) else data
-            value = container.get(field) if isinstance(container, dict) else None
+            value = record_account(account, field, data)
             log(f"{field}={value if value is not None else '<unavailable>'}")
         except Exception as exc:
             log(f"WARNING: {path} 查询失败：{redact(exc)}；签到结果保持成功。")
+    return account
 
 
 SESSION_LOST_HINT = (
@@ -298,6 +311,9 @@ def _attempt(page, cookie_header=None):
         page.wait_for_selector(CHECKIN_BUTTON, timeout=SELECTOR_TIMEOUT_MS)
     except Exception as exc:
         text = _page_text(page)
+        result = classify_page_state(text)
+        if result.ok or result.status == "fatal":
+            return result
         raise RetryableError(
             f"签到按钮没有出现（页面可能改版、没加载完或会话被弹回）：{redact(exc)}；"
             f"当前地址={page.url}；页面文案片段={text[:200]!r}"
@@ -312,12 +328,12 @@ def _attempt(page, cookie_header=None):
     if disabled:
         text = _page_text(page)
         result = classify_page_state(text)
-        if result.ok:
-            log(f"按钮不可点击，页面显示今日已完成：{result.message}")
+        if result.ok or result.status == "fatal":
+            log(f"按钮不可点击，页面结果：{result.message}")
             return result
-        # 站点自己的完成态就是最强证据：按钮被禁用即今日已签到，不要误判为失败。
-        log(f"按钮不可点击（is-done={done_class}），按“今日已签到”处理；页面文案片段={text[:200]!r}")
-        return CheckinResult("already", label or "按钮已禁用（今日已签到）", source="dom")
+        if done_class:
+            return CheckinResult("already", label or "今日已签到", source="dom")
+        return CheckinResult("retryable", "签到按钮暂不可用，未确认签到结果。", source="dom")
 
     try:
         log("点击签到按钮…")
@@ -335,13 +351,14 @@ def _attempt(page, cookie_header=None):
             page.locator(CHECKIN_BUTTON).first.click(timeout=CLICK_TIMEOUT_MS)
         response = response_info.value
         log(f"签到接口 HTTP {response.status}：{response.url}")
+        if response.status in (401, 403):
+            return CheckinResult("fatal", f"签到接口拒绝访问（HTTP {response.status}）。", source="api")
         try:
             payload = response.json()
         except Exception as exc:
             raise RetryableError(f"签到接口返回非 JSON 内容（HTTP {response.status}）。") from exc
         result = classify_payload(payload)
-        log(f"签到接口 code={payload.get('code')}，message={payload.get('message', '<none>')}，"
-            f"reason={payload.get('reason', '<none>')}，points={payload.get('points', '<none>')}")
+        log(f"签到结果={result.status}，消息={result.message}")
         return result
     except (FatalError, RetryableError):
         raise
@@ -365,9 +382,8 @@ def _attempt(page, cookie_header=None):
             now_disabled = page.locator(CHECKIN_BUTTON).first.is_disabled(timeout=5_000)
         except Exception:
             now_disabled = False
-        if now_disabled:
-            log("点击后按钮已禁用，站点自身状态显示今日已完成，按“今日已签到”处理。")
-            return CheckinResult("already", "按钮已禁用（今日已签到）", source="dom")
+        if now_disabled and _button_is_done(page):
+            return CheckinResult("already", "今日已签到", source="dom")
         raise RetryableError(f"点击签到按钮后没有拿到结果：{redact(exc)}") from exc
 
 
@@ -417,11 +433,11 @@ def run(cookie_header=None, headless=True, dry_run=False, max_attempts=MAX_ATTEM
     if not use_email and kind != "gld":
         log("Cookie 使用 koa 或其他会话格式，是否有效以服务端回复为准。")
 
-    # 保留 apply_jitter 参数兼容旧调用，但不再为随机签到时间占用 runner。
+    # 保留 apply_jitter 参数兼容旧调用。
     if dry_run:
         log("dry-run：不点击签到按钮。")
     else:
-        log("立即开始签到；随机时间由 config/schedule.json 与工作流 cron 安排，不在运行中等待。")
+        log("立即开始签到。")
 
     browser_channel = get_env("GLADOS_BROWSER_CHANNEL") or (channel or "")
     log(f"启动 Chromium（playwright {_playwright_version()}，headless={headless}，"
@@ -468,7 +484,7 @@ def run(cookie_header=None, headless=True, dry_run=False, max_attempts=MAX_ATTEM
                     return _dry_run(page)
                 result = _checkin_with_retry(page, max_attempts, retry_delay)
                 if result.ok:
-                    read_account(page)
+                    result.account = read_account(page)
                 else:
                     _screenshot(page, "checkin-failed")
                 return (EXIT_OK if result.ok else _exit_code(result.status)), result
@@ -545,7 +561,7 @@ def _fatal_hint(result):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="用真实浏览器完成 GLaDOS 签到")
     parser.add_argument("--dry-run", action="store_true",
-                        help="只检查登录态与按钮，不等待随机时间、不点击")
+                        help="只检查登录态与按钮，不点击")
     parser.add_argument("--headed", action="store_true", help="显示浏览器窗口（本机调试用）")
     parser.add_argument("--no-jitter", action="store_true", help="兼容旧命令；现在默认立即签到")
     parser.add_argument("--timeout-seconds", type=int, default=None,
@@ -558,7 +574,7 @@ def parse_args(argv=None):
 
 def apply_arg_overrides(args):
     if args.timeout_seconds is not None:
-        log("--timeout-seconds 已停用；随机时间范围请修改 config/schedule.json。")
+        log("--timeout-seconds 已停用。")
 
 
 def main(argv=None):

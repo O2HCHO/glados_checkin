@@ -1,9 +1,13 @@
 import unittest
+from decimal import Decimal
 from unittest.mock import Mock, patch
+
+import requests
 
 import browser_checkin
 import api_checkin
 import checkin
+import checkin_push
 
 VALID_COOKIE = "gld:sess=" + "A" * 180 + "; gld:sess.sig=" + "B" * 120
 
@@ -63,6 +67,98 @@ class MainTests(unittest.TestCase):
                 patch.object(checkin, "send_failure_email") as email:
             self.assertEqual(checkin.main([]), checkin.EXIT_FATAL)
         email.assert_called_once()
+
+    def test_dry_run_does_not_send_notifications(self):
+        with patch.dict("os.environ", {"GLADOS_COOKIE": VALID_COOKIE}), \
+                patch.object(api_checkin, "run",
+                             return_value=(1, browser_checkin.CheckinResult("fatal", "invalid"))), \
+                patch.object(checkin, "send_push") as push, \
+                patch.object(checkin, "send_failure_email") as email:
+            self.assertEqual(checkin.main(["--dry-run"]), checkin.EXIT_FATAL)
+        push.assert_not_called()
+        email.assert_not_called()
+
+    def test_push_failure_preserves_successful_exit(self):
+        with patch.dict("os.environ", {"GLADOS_COOKIE": VALID_COOKIE}), \
+                patch.object(api_checkin, "run",
+                             return_value=(0, browser_checkin.CheckinResult("success", "Checkin! Got 1 Points"))), \
+                patch.object(checkin, "send_push", side_effect=RuntimeError("private-token")) as push:
+            self.assertEqual(checkin.main([]), checkin.EXIT_OK)
+        push.assert_called_once_with("success", "1", account={}, message="Checkin! Got 1 Points")
+        self.assertNotIn("private-token", str(checkin.log.call_args_list))
+
+    def test_configured_push_replaces_failure_email(self):
+        with patch.dict("os.environ", {"GLADOS_COOKIE": VALID_COOKIE, "PUSHPLUS_TOKEN": "test-token"}), \
+                patch.object(api_checkin, "run",
+                             return_value=(2, browser_checkin.CheckinResult("retryable", "timeout"))), \
+                patch.object(checkin_push, "_send") as send, \
+                patch.object(checkin, "send_failure_email") as email:
+            self.assertEqual(checkin.main([]), checkin.EXIT_RETRYABLE)
+        send.assert_called_once()
+        email.assert_not_called()
+
+
+class PushTests(unittest.TestCase):
+    def setUp(self):
+        clean_environment(self)
+        push_log = patch.object(checkin_push, "log")
+        self.push_log = push_log.start()
+        self.addCleanup(push_log.stop)
+        post = patch.object(requests, "post")
+        self.post = post.start()
+        self.addCleanup(post.stop)
+
+    def test_default_only_pushes_failures(self):
+        self.post.return_value = Mock(status_code=200)
+        self.post.return_value.json.return_value = {"code": 200}
+        with patch.dict("os.environ", {"PUSHPLUS_TOKEN": "test-token"}):
+            self.assertTrue(checkin_push.send_push("success", "1"))
+            self.assertTrue(checkin_push.send_push("already"))
+            self.post.assert_not_called()
+            self.assertTrue(checkin_push.send_push("fatal"))
+        self.assertIn("本次运行失败 0/1", self.post.call_args.kwargs["json"]["title"])
+
+    def test_all_channels_send_reward_and_continue_after_provider_failure(self):
+        server_reply = Mock(status_code=200)
+        server_reply.json.return_value = {"code": 0}
+        telegram_reply = Mock(status_code=200)
+        telegram_reply.json.return_value = {"ok": True}
+        self.post.side_effect = [requests.Timeout("private-token"), server_reply, telegram_reply]
+        env = {
+            "PUSHPLUS_TOKEN": "private-token", "SERVERCHAN_SENDKEY": "sctp42ttest-key",
+            "TELEGRAM_BOT_TOKEN": "123:bot_key", "TELEGRAM_CHAT_ID": "-100",
+            "PUSH_LEVEL": "all", "GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "123",
+        }
+        account = {
+            "account": "te***@example.com", "points": Decimal("311.0000"), "leftDays": Decimal("479"),
+            "plans": [{"points": 500, "days": 100}, {"points": 100, "days": 10}],
+        }
+        with patch.dict("os.environ", env):
+            self.assertTrue(checkin_push.send_push("success", "1", account=account,
+                                                  message="Checkin! Got 1 Points"))
+        pushplus, serverchan, telegram = self.post.call_args_list
+        self.assertIn("当前积分：311（+1）", pushplus.kwargs["json"]["content"])
+        self.assertEqual(serverchan.args[0], "https://42.push.ft07.com/sctp42ttest-key.send")
+        self.assertIn("actions/runs/123", serverchan.kwargs["data"]["desp"])
+        self.assertIn("剩余天数：479 天", serverchan.kwargs["data"]["desp"])
+        self.assertIn("100 分 → 10 天（可兑换）", serverchan.kwargs["data"]["desp"])
+        self.assertIn("500 分 → 100 天（差 189 积分）", serverchan.kwargs["data"]["desp"])
+        self.assertIn("北京时间 UTC+8", serverchan.kwargs["data"]["desp"])
+        self.assertEqual(telegram.kwargs["json"]["chat_id"], "-100")
+        self.assertIn("Checkin! Got 1 Points", telegram.kwargs["json"]["text"])
+        self.assertTrue(all(not entry.kwargs["allow_redirects"] for entry in self.post.call_args_list))
+        self.assertIn("PushPlus 推送失败", str(self.push_log.call_args_list))
+        self.assertNotIn("private-token", str(self.push_log.call_args_list))
+
+    def test_serverchan_turbo_checks_business_response(self):
+        self.post.return_value = Mock(status_code=200)
+        self.post.return_value.json.return_value = {"code": 1, "message": "private-key"}
+        with patch.dict("os.environ", {"SERVERCHAN_SENDKEY": "SCTtest_key", "PUSH_LEVEL": "all"}):
+            self.assertTrue(checkin_push.send_push("already"))
+        self.assertEqual(self.post.call_args.args[0], "https://sctapi.ftqq.com/SCTtest_key.send")
+        self.assertIn("今日已签到", self.post.call_args.kwargs["data"]["title"])
+        self.assertIn("Server 酱 推送失败", str(self.push_log.call_args_list))
+        self.assertNotIn("private-key", str(self.push_log.call_args_list))
 
 
 class FailureEmailTests(unittest.TestCase):

@@ -11,6 +11,7 @@ from email.message import EmailMessage
 
 import browser_checkin
 import api_checkin
+from checkin_push import send_push
 from email_login import email_mode
 from glados_cookie import (
     FatalError,
@@ -56,6 +57,7 @@ def send_failure_email(summary):
 def main(argv=None):
     args = browser_checkin.parse_args(argv)
     browser_checkin.apply_arg_overrides(args)
+    backend = None
     try:
         cookie = None if email_mode() else require_cookie()
         backend = api_checkin.resolve_backend()
@@ -69,22 +71,29 @@ def main(argv=None):
                 apply_jitter=False,
                 channel=args.channel,
             )
-        if code != EXIT_OK:
-            hint = browser_checkin._fatal_hint(result) if backend == "browser" else "请查看 Cookie API 的具体回复。"
-            send_failure_email(f"{result.message}\n{hint}")
-        return code
     except FatalError as exc:
         log(f"ERROR: {exc}")
-        send_failure_email(str(exc))
-        return EXIT_FATAL
+        code, result = EXIT_FATAL, browser_checkin.CheckinResult("fatal", str(exc))
     except RetryableError as exc:
         log(f"ERROR: {exc}")
-        send_failure_email(str(exc))
-        return EXIT_RETRYABLE
+        code, result = EXIT_RETRYABLE, browser_checkin.CheckinResult("retryable", str(exc))
     except Exception as exc:  # 未知异常也要给出可读结论，避免 Actions 只有堆栈
         log(f"ERROR: 未预期的失败：{redact(exc)}")
-        send_failure_email(str(exc))
-        return EXIT_FATAL
+        code, result = EXIT_FATAL, browser_checkin.CheckinResult("fatal", str(exc))
+
+    if not args.dry_run:
+        try:
+            push_configured = send_push(result.status, result.earned_points,
+                                        account=result.account, message=result.message if result.ok else "")
+        except Exception:
+            log("推送失败，请检查渠道配置。")
+            push_configured = True
+        if code != EXIT_OK and not push_configured:
+            summary = result.message
+            if backend == "browser":
+                summary += "\n" + browser_checkin._fatal_hint(result)
+            send_failure_email(summary)
+    return code
 
 
 if __name__ == "__main__":

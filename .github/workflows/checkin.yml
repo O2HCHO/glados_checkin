@@ -2,13 +2,8 @@ name: GLaDOS Checkin
 
 on:
   schedule:
-    # 首次按北京时间 09:00 启动；后续由 random_schedule.py 同步 config 和下一次日期。
-    # BEGIN GLADOS RANDOM SCHEDULE
-    - cron: "18 1 13 11 *"
-    # END GLADOS RANDOM SCHEDULE
-    # 固定兜底：北京时间 14:47 / 19:37。未到期时仅检查配置，不安装依赖或访问 GLaDOS。
-    - cron: "47 6 * * *"
-    - cron: "37 11 * * *"
+    # 01:30 UTC = 北京时间 09:30
+    - cron: "30 1 * * *"
   workflow_dispatch:
 
 permissions:
@@ -25,16 +20,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-        with:
-          # 排队中的旧触发也读取最新分支，避免重复使用已推进的旧排程。
-          ref: ${{ github.event_name == 'schedule' && github.event.repository.default_branch || github.ref_name }}
-
-      - name: Check whether checkin is due
-        id: due
-        run: python3 -u random_schedule.py --check-due
 
       - name: Set up Python
-        if: steps.due.outputs.run_checkin == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -44,14 +31,12 @@ jobs:
             requirements-browser.txt
 
       - name: Install dependencies
-        if: steps.due.outputs.run_checkin == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
       - name: Select checkin backend
         id: backend
-        if: steps.due.outputs.run_checkin == 'true'
         env:
           GLADOS_AUTH_MODE: ${{ vars.GLADOS_AUTH_MODE }}
           GLADOS_CHECKIN_METHOD: ${{ vars.GLADOS_CHECKIN_METHOD }}
@@ -81,7 +66,6 @@ jobs:
         run: python -m playwright install --with-deps chromium
 
       - name: Verify script (offline unit tests)
-        if: steps.due.outputs.run_checkin == 'true'
         run: python -B -m unittest -q
 
       - name: Verify login redirect handling (isolated browser test)
@@ -92,7 +76,6 @@ jobs:
 
       - name: Run checkin script
         id: checkin
-        if: steps.due.outputs.run_checkin == 'true'
         continue-on-error: true
         timeout-minutes: 12
         env:
@@ -111,6 +94,11 @@ jobs:
           # 可选；仅在原浏览器请求确实带对应 Authorization 时配置。
           GLADOS_FP: ${{ secrets.GLADOS_FP }}
           GLADOS_SCREENSHOT_ON_FAIL: "1"
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'all' }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
@@ -118,15 +106,7 @@ jobs:
           SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-        run: python -u checkin.py --no-jitter
-
-      - name: Save the next random checkin time
-        if: ${{ always() && !cancelled() && (steps.checkin.outcome == 'success' || steps.checkin.outcome == 'failure') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-        timeout-minutes: 3
-        env:
-          SCHEDULE_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: python -u random_schedule.py
+        run: python -u checkin.py
 
       - name: Upload failure screenshots
         if: ${{ always() && !cancelled() && steps.checkin.outcome == 'failure' }}
