@@ -153,14 +153,20 @@ def run(cookie_header=None, dry_run=False, max_attempts=MAX_ATTEMPTS, retry_dela
             session.headers["User-Agent"] = get_env("GLADOS_USER_AGENT")
         if fingerprint:
             session.headers["Authorization"] = fingerprint
-        log("Cookie 接口模式：立即签到，复用已有会话，不发送邮箱验证码。")
+        log("Cookie 接口模式：" + ("只读检查会话。" if dry_run else "复用已有会话签到。"))
         log("设备配置：GLADOS_USER_AGENT=" + ("已配置" if get_env("GLADOS_USER_AGENT") else "未配置")
             + "；GLADOS_FP=" + ("已配置" if fingerprint else "未配置（可选）") + "。")
         if dry_run:
             data = _json_request(session, requests, "get", "/api/user/status")
-            if data.get("code") == 0:
-                return 0, CheckinResult("success", "dry-run：服务端确认 Cookie 有效，未发送签到请求。", source="api-cookie")
-            return 1, CheckinResult("fatal", "dry-run：服务端未接受 Cookie，请重新导出完整会话。", source="api-cookie")
+            code = data.get("code")
+            rejection = rejection_message(data)
+            if type(code) is int and code == 0 and not rejection:
+                message = "dry-run：服务端确认 Cookie 有效（code=0），未发送签到请求。"
+                log(message)
+                return 0, CheckinResult("success", message, source="api-cookie")
+            message = rejection or "会话状态未确认，请在官网核对登录状态。"
+            log(f"ERROR: dry-run：{message}")
+            return 1, CheckinResult("fatal", message, source="api-cookie")
         result = None
         for attempt in range(1, max(1, max_attempts) + 1):
             try:

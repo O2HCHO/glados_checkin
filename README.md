@@ -101,6 +101,7 @@ navigator.userAgent                // 完整结果存为 Variable GLADOS_USER_AG
 | 签到接口 `device-mismatch` | 先核对同一登录浏览器的 Cookie 与 UA；Authorization/FP 仅在原请求确实存在时配置 |
 | `please checkin via ...` | 核对签到 token，当前默认 `glados.cloud` |
 | `Automated check-in detected` / `captcha_required` | 服务端拒绝本次签到，请在官网手动处理 |
+| `Cloudflare 验证失败` | 打开官网签到页，按页面提示完成验证后手动签到。用 Actions 的只读检查单独确认 Cookie 是否有效 |
 | `Checkin! Got 1 Points` | 服务端确认本次签到获得 1 积分，可在官网积分流水核对 |
 | `未配置完整 SMTP` | 未启用失败邮件通知，与 QQ IMAP 或签到认证是否成功无关 |
 
@@ -113,6 +114,7 @@ navigator.userAgent                // 完整结果存为 Variable GLADOS_USER_AG
 更新默认分支后，可移除旧的 `SCHEDULE_TOKEN` Secret。如果该令牌只用于旧排程，也可以撤销它。
 在 Actions 的 **GLaDOS Checkin → Run workflow** 可立即触发一次。若要核对奖励，请在当天首次签到时执行，
 对照签到消息和官网积分流水。实际积分由 GLaDOS 决定。
+要单独验证 GitHub 的 Cookie，勾选 **diagnose_cookie**。任务只查询账号状态，跳过签到和通知。
 
 ## 配置项
 

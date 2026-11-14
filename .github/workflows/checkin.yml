@@ -5,6 +5,11 @@ on:
     # 01:30 UTC = 北京时间 09:30
     - cron: "30 1 * * *"
   workflow_dispatch:
+    inputs:
+      diagnose_cookie:
+        description: "只读检查 GLADOS_COOKIE，不提交签到或发送通知"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,8 +43,8 @@ jobs:
       - name: Select checkin backend
         id: backend
         env:
-          GLADOS_AUTH_MODE: ${{ vars.GLADOS_AUTH_MODE }}
-          GLADOS_CHECKIN_METHOD: ${{ vars.GLADOS_CHECKIN_METHOD }}
+          GLADOS_AUTH_MODE: ${{ inputs.diagnose_cookie && 'cookie' || vars.GLADOS_AUTH_MODE }}
+          GLADOS_CHECKIN_METHOD: ${{ inputs.diagnose_cookie && 'api' || vars.GLADOS_CHECKIN_METHOD }}
         run: |
           python - <<'PY'
           import os
@@ -80,8 +85,9 @@ jobs:
         timeout-minutes: 12
         env:
           # email 模式在当前浏览器登录后直接签到，不依赖手工导出的 Cookie/FP/UA。
-          GLADOS_AUTH_MODE: ${{ vars.GLADOS_AUTH_MODE }}
-          GLADOS_CHECKIN_METHOD: ${{ vars.GLADOS_CHECKIN_METHOD }}
+          GLADOS_AUTH_MODE: ${{ inputs.diagnose_cookie && 'cookie' || vars.GLADOS_AUTH_MODE }}
+          GLADOS_CHECKIN_METHOD: ${{ inputs.diagnose_cookie && 'api' || vars.GLADOS_CHECKIN_METHOD }}
+          DIAGNOSE_COOKIE: ${{ inputs.diagnose_cookie }}
           GLADOS_CHECKIN_TOKEN: ${{ vars.GLADOS_CHECKIN_TOKEN }}
           GLADOS_EMAIL: ${{ secrets.GLADOS_EMAIL }}
           QQ_IMAP_USERNAME: ${{ secrets.QQ_IMAP_USERNAME }}
@@ -106,7 +112,12 @@ jobs:
           SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-        run: python -u checkin.py
+        run: |
+          if [[ "$DIAGNOSE_COOKIE" == "true" ]]; then
+            python -u checkin.py --dry-run
+          else
+            python -u checkin.py
+          fi
 
       - name: Upload failure screenshots
         if: ${{ always() && !cancelled() && steps.checkin.outcome == 'failure' }}
