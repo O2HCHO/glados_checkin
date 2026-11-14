@@ -70,6 +70,9 @@ def classify_checkin(data):
     result = classify_payload(data)
     result.source = "api-cookie"
     if result.status == "fatal":
+        code = data.get("code")
+        if type(code) is int and -999 <= code <= 999:
+            result.message += f"（业务 code={code}）"
         return result
     message = str(data.get("message", ""))
     if "please checkin via" in message.lower():
@@ -78,7 +81,9 @@ def classify_checkin(data):
     if result.status == "retryable":
         # 未知业务回复不盲目重复提交；HTTP/网络临时故障才重试。
         result.status = "fatal"
-        result.message = "未知签到回复，未确认成功，请核对官网签到记录。"
+        code = data.get("code")
+        detail = f"（业务 code={code}）" if type(code) is int and -999 <= code <= 999 else ""
+        result.message = f"未知签到回复{detail}，未确认成功，请核对官网签到记录。"
     return result
 
 

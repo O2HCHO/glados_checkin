@@ -92,6 +92,8 @@ def rejection_message(payload):
     lowered = str(payload.get("message", "")).lower()
     reason = str(payload.get("reason", "")).strip().lower()
     code = payload.get("code")
+    if "cloudflare verification failed" in lowered:
+        return "GLaDOS 的 Cloudflare 验证失败。请打开官网签到页，按页面提示完成验证后签到。"
     if payload.get("captcha_required") or reason == "captcha_required" or any(
         marker in lowered for marker in CAPTCHA_MARKERS
     ):

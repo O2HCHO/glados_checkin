@@ -167,6 +167,15 @@ class APITests(unittest.TestCase):
         self.assertEqual(repeat.status, "already")
         self.assertIsNone(repeat.earned_points)
         self.assertEqual(api_checkin.classify_checkin({"code": 1, "message": "Unknown business error"}).status, "fatal")
+        cloudflare = api_checkin.classify_checkin({
+            "code": 5, "message": "Cloudflare verification failed. Nothing was recorded — please retry.",
+        })
+        self.assertEqual(cloudflare.status, "fatal")
+        self.assertIn("Cloudflare 验证失败", cloudflare.message)
+        self.assertIn("code=5", cloudflare.message)
+        unknown = api_checkin.classify_checkin({"code": 5, "message": "private reply"})
+        self.assertIn("code=5", unknown.message)
+        self.assertNotIn("private reply", unknown.message)
         self.assertEqual(api_checkin.classify_checkin({"code": 1, "message": "please checkin via https://glados.cloud"}).status, "fatal")
 
     def test_account_display_failure_does_not_undo_confirmed_checkin(self):
